@@ -475,6 +475,24 @@ button.active, .seg-btn.active {
 
 .calendar-svg {
   display: block;
+  user-select: none;
+  touch-action: none;
+}
+
+.calendar-svg .cal-cell.in-sel {
+  stroke: var(--accent);
+  stroke-width: 2;
+}
+
+.chart-svg {
+  touch-action: pan-y;
+}
+
+.chart-svg .sel-rect {
+  fill: var(--accent-soft);
+  stroke: var(--accent);
+  stroke-width: 1;
+  pointer-events: none;
 }
 
 .calendar-svg .cal-cell {

@@ -1058,6 +1058,9 @@
     return seriesColorMap(stackMode, keys);
   }
 
+  let timelineDrag = null; // { start, cur, moved } bar indices while a drag-selection is in progress
+  let calendarDrag = null; // { start, cur } ISO dates while dragging across calendar cells
+
   // Hourly bars beyond this many days get too thin to read; show the most recent window instead
   const HOURLY_MAX_DAYS = 31;
 
@@ -1133,8 +1136,8 @@
     if (subEl) {
       const hint =
         grain === "hour"
-          ? "Local-time hourly buckets · Hover a legend item to highlight it, click to filter · Click a bar to isolate that day"
-          : "Hover a legend item to highlight it, click to filter · Click a bar to isolate a date/week";
+          ? "Local-time hourly buckets · Hover a legend item to highlight it, click to filter · Click a bar, or drag across bars, to select days"
+          : "Hover a legend item to highlight it, click to filter · Click a bar, or drag across bars, to select a date range";
       subEl.textContent = [...notes, hint].join(" · ");
     }
 
@@ -1318,6 +1321,9 @@
       svgOut += `<rect class="bar-hit" data-idx="${idx}" x="${(padL + idx * stepX).toFixed(2)}" y="${padT}" width="${stepX.toFixed(2)}" height="${plotH}" fill="transparent" style="cursor:pointer" />`;
     });
 
+    // Drag-to-select overlay (hidden until a drag starts)
+    svgOut += `<rect class="sel-rect" x="0" y="${padT}" width="0" height="${plotH}" visibility="hidden" />`;
+
     const labelAt = (idx, txt) => {
       const cx = padL + idx * stepX + stepX / 2;
       svgOut += `<text x="${cx.toFixed(1)}" y="${height - 8}" text-anchor="middle" fill="var(--text-dim)" font-size="11" font-family="var(--mono)">${esc(txt)}</text>`;
@@ -1359,6 +1365,7 @@
         rect.setAttribute("fill", "rgba(127,127,127,0.07)");
       });
       rect.addEventListener("mousemove", (ev) => {
+        if (timelineDrag) return;
         const d = periodData[Number(rect.dataset.idx)];
         if (!d) return;
         const rowsHtml = finalKeys
@@ -1383,20 +1390,82 @@
       });
       rect.addEventListener("mouseleave", () => {
         rect.setAttribute("fill", "transparent");
-        tooltip.hidden = true;
-      });
-      rect.addEventListener("click", () => {
-        const d = periodData[Number(rect.dataset.idx)];
-        if (!d) return;
-        if (grain === "week") {
-          isolateDates(d.period, addDaysISO(d.period, 6));
-        } else {
-          const day = d.period.slice(0, 10);
-          isolateDates(day, day);
-        }
-        tooltip.hidden = true;
+        if (!timelineDrag) tooltip.hidden = true;
       });
     });
+
+    // Click a bar to isolate it, or press and drag left/right to select a span of bars.
+    // Date filters are day-granular, so hourly selections snap to whole days.
+    const selRect = svg.querySelector(".sel-rect");
+    const periodStart = (p) => p.slice(0, 10);
+    const periodEnd = (p) => (grain === "week" ? addDaysISO(p, 6) : p.slice(0, 10));
+    const idxFromEvent = (ev) => {
+      const box = svg.getBoundingClientRect();
+      if (!box.width) return null;
+      const x = (ev.clientX - box.left) * (width / box.width);
+      return Math.max(0, Math.min(n - 1, Math.floor((x - padL) / stepX)));
+    };
+    const drawSelection = () => {
+      const lo = Math.min(timelineDrag.start, timelineDrag.cur);
+      const hi = Math.max(timelineDrag.start, timelineDrag.cur);
+      selRect.setAttribute("x", (padL + lo * stepX).toFixed(2));
+      selRect.setAttribute("width", ((hi - lo + 1) * stepX).toFixed(2));
+      selRect.setAttribute("visibility", "visible");
+      return [lo, hi];
+    };
+    const showSelectionTip = (ev, lo, hi) => {
+      let sum = 0;
+      for (let i = lo; i <= hi; i++) sum += periodData[i].total;
+      const from = periodStart(periodData[lo].period);
+      const to = periodEnd(periodData[hi].period);
+      const days = dateSpanDays(from, to) + 1;
+      const span =
+        grain === "hour"
+          ? `${hi - lo + 1} h → ${days} day${days === 1 ? "" : "s"}`
+          : `${days} day${days === 1 ? "" : "s"}`;
+      tooltip.innerHTML = `
+        <div class="tt-title"><span>${esc(from)}${to !== from ? " → " + esc(to) : ""}</span><span class="num">${fmtMetric(sum, metric)}</span></div>
+        <div class="tt-row"><span>${esc(span)}</span><span>release to select</span></div>
+      `;
+      positionTooltip(tooltip, ev);
+    };
+    svg.onpointerdown = (ev) => {
+      if (ev.button !== 0) return;
+      const box = svg.getBoundingClientRect();
+      const x = (ev.clientX - box.left) * (width / (box.width || 1));
+      if (x < padL || x > padL + plotW) return;
+      const idx = idxFromEvent(ev);
+      if (idx === null) return;
+      timelineDrag = { start: idx, cur: idx, moved: false };
+      try {
+        svg.setPointerCapture(ev.pointerId);
+      } catch {}
+      ev.preventDefault();
+    };
+    svg.onpointermove = (ev) => {
+      if (!timelineDrag) return;
+      const idx = idxFromEvent(ev);
+      if (idx === null) return;
+      if (idx !== timelineDrag.start) timelineDrag.moved = true;
+      timelineDrag.cur = idx;
+      if (!timelineDrag.moved) return;
+      const [lo, hi] = drawSelection();
+      showSelectionTip(ev, lo, hi);
+    };
+    svg.onpointerup = () => {
+      if (!timelineDrag) return;
+      const lo = Math.min(timelineDrag.start, timelineDrag.cur);
+      const hi = Math.max(timelineDrag.start, timelineDrag.cur);
+      timelineDrag = null;
+      tooltip.hidden = true;
+      if (!periodData[lo] || !periodData[hi]) return;
+      isolateDates(periodStart(periodData[lo].period), periodEnd(periodData[hi].period));
+    };
+    svg.onpointercancel = () => {
+      timelineDrag = null;
+      selRect.setAttribute("visibility", "hidden");
+      tooltip.hidden = true;
+    };
 
     const otherSum = rankedSeries.slice(maxKeep).reduce((s, e) => s + e[1], 0);
     const otherCount = rankedSeries.length - maxKeep;
@@ -1558,6 +1627,7 @@
     const dowFull = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
     wrap.querySelectorAll(".cal-cell").forEach((el) => {
       el.addEventListener("mousemove", (ev) => {
+        if (calendarDrag) return;
         const d = el.dataset.date;
         const v = dayVals.get(d) || 0;
         const [y, m, dd] = d.split("-").map(Number);
@@ -1571,9 +1641,26 @@
       el.addEventListener("mouseleave", () => {
         tooltip.hidden = true;
       });
-      el.addEventListener("click", () => {
-        tooltip.hidden = true;
-        isolateDates(el.dataset.date, el.dataset.date);
+      // Press on a day and drag across others to select the span between them (a plain click selects one day)
+      el.addEventListener("pointerdown", (ev) => {
+        if (ev.button !== 0) return;
+        ev.preventDefault();
+        calendarDrag = { start: el.dataset.date, cur: el.dataset.date };
+        paintCalendarSelection(wrap);
+      });
+      el.addEventListener("pointerenter", (ev) => {
+        if (!calendarDrag) return;
+        calendarDrag.cur = el.dataset.date;
+        paintCalendarSelection(wrap);
+        const [lo, hi] = [calendarDrag.start, calendarDrag.cur].sort();
+        let sum = 0;
+        for (const [d, v] of dayVals) if (d >= lo && d <= hi) sum += v;
+        const days = dateSpanDays(lo, hi) + 1;
+        tooltip.innerHTML = `
+          <div class="tt-title"><span>${esc(lo)}${hi !== lo ? " → " + esc(hi) : ""}</span><span class="num">${fmtMetric(sum, metric)}</span></div>
+          <div class="tt-row"><span>${days} day${days === 1 ? "" : "s"}</span><span>release to select</span></div>
+        `;
+        positionTooltip(tooltip, ev);
       });
     });
 
@@ -1605,6 +1692,22 @@
       ${busiest ? `<span>Busiest <strong class="num">${esc(busiest[0])}</strong> (${fmtMetric(busiest[1], metric)})</span>` : ""}
       <span class="cal-legend">Less ${legendCells} More</span>
     `;
+  }
+
+  function paintCalendarSelection(wrap) {
+    const [lo, hi] = calendarDrag ? [calendarDrag.start, calendarDrag.cur].sort() : ["", ""];
+    wrap.querySelectorAll(".cal-cell").forEach((c) => {
+      const d = c.dataset.date;
+      c.classList.toggle("in-sel", !!calendarDrag && d >= lo && d <= hi);
+    });
+  }
+
+  function finishCalendarDrag() {
+    if (!calendarDrag) return;
+    const [lo, hi] = [calendarDrag.start, calendarDrag.cur].sort();
+    calendarDrag = null;
+    document.getElementById("chart-tooltip").hidden = true;
+    isolateDates(lo, hi);
   }
 
   // -------------------------------------------------------------------------
@@ -2770,6 +2873,8 @@
       renderAll();
       showToast("Reset rate card to calibrated defaults.");
     });
+
+    window.addEventListener("pointerup", finishCalendarDrag);
 
     let resizeRaf = 0;
     window.addEventListener("resize", () => {
