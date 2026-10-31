@@ -1,0 +1,318 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Local AI Token Observatory</title>
+  <link rel="stylesheet" href="./styles.css" />
+</head>
+<body>
+  <div class="app-shell">
+    <!-- Top Header -->
+    <header class="top-header">
+      <div class="brand-group">
+        <div class="brand-mark">Σ</div>
+        <div>
+          <h1 class="brand-title">Local AI Token Spend &amp; Usage Observatory</h1>
+          <p class="brand-sub" id="meta-subtitle">Loading local harness telemetry…</p>
+        </div>
+      </div>
+
+      <div class="header-actions">
+        <button id="btn-refresh" class="btn-primary" title="Re-scan local logs incrementally">
+          ↻ Refresh Logs
+        </button>
+        <button id="btn-billing" title="Inspect or customize real out-of-pocket subscriptions, overages &amp; promo credits">
+          💳 Billing &amp; Overages
+        </button>
+        <button id="btn-rates" title="Inspect or customize $/1M API-equivalent rates">
+          $ API Rate Card
+        </button>
+        <button id="btn-export-csv" title="Download currently filtered daily cube as CSV">
+          ↓ Export CSV
+        </button>
+        <button id="btn-theme" title="Toggle Dark / Light theme">
+          ◐ Theme
+        </button>
+      </div>
+    </header>
+
+    <!-- Global Controls & Date / Metric Bar -->
+    <section class="control-bar">
+      <div class="control-group">
+        <span class="control-label">Range</span>
+        <div class="seg-group" id="range-presets">
+          <button class="seg-btn active" data-range="all">All Time</button>
+          <button class="seg-btn" data-range="7d">7d</button>
+          <button class="seg-btn" data-range="14d">14d</button>
+          <button class="seg-btn" data-range="30d">30d</button>
+          <span id="month-presets" style="display:contents"></span>
+        </div>
+        <input type="date" id="date-from" aria-label="Start date" />
+        <span style="color: var(--text-dim)">→</span>
+        <input type="date" id="date-to" aria-label="End date" />
+      </div>
+
+      <div class="control-group">
+        <span class="control-label">Primary Metric</span>
+        <select id="metric-select">
+          <option value="total">Total Tokens (incl. Cache Read)</option>
+          <option value="active">Fresh / Active Tokens (excl. Cache Read)</option>
+          <option value="generated">Generated Only (Output + Reasoning)</option>
+          <option value="paid_cost">Actual Out-of-Pocket Paid ($)</option>
+          <option value="est_cost">Est. API-Equivalent Value ($)</option>
+        </select>
+
+        <label class="checkbox-pill" title="Include older cleaned-up Claude Code history recovered from ~/.claude/stats-cache.json">
+          <input type="checkbox" id="chk-archived" checked />
+          Pre-cleanup Claude history
+        </label>
+      </div>
+    </section>
+
+    <!-- Active Cross-Filter Pills -->
+    <div class="active-filters" id="active-filters" hidden></div>
+
+    <!-- 6-Card Executive KPI Strip -->
+    <section class="kpi-grid" id="kpi-grid"></section>
+
+    <!-- Actual Out-of-Pocket Spend, Subscriptions & Overage Forensics -->
+    <section class="panel" id="billing-panel">
+      <div class="panel-header">
+        <div>
+          <h2 class="panel-title">Actual Out-of-Pocket Spend, Subscriptions &amp; Overage Forensics</h2>
+          <p class="panel-subtitle" id="billing-panel-subtitle">
+            Real cash outlay (subscriptions + credit/extra-usage overages, net of free promo credits) vs. API list value
+          </p>
+        </div>
+        <div class="control-group">
+          <button id="btn-open-billing-inline" class="btn-primary">✎ Edit Subscriptions &amp; Overages</button>
+        </div>
+      </div>
+
+      <div class="grid-billing">
+        <div>
+          <div class="comp-bar" id="billing-mix-bar"></div>
+          <div class="table-wrap" id="billing-harness-wrap"></div>
+        </div>
+        <div class="forensics-stack" id="billing-forensics-wrap"></div>
+      </div>
+    </section>
+
+    <!-- Interactive Timeline Chart -->
+    <section class="panel">
+      <div class="panel-header">
+        <div>
+          <h2 class="panel-title">Token Velocity Over Time</h2>
+          <p class="panel-subtitle" id="timeline-subtitle">Click any legend item to filter, or click a bar to isolate a date/week</p>
+        </div>
+        <div class="control-group">
+          <span class="control-label">Stack By</span>
+          <div class="seg-group" id="chart-stack-group">
+            <button class="seg-btn active" data-stack="harness">Harness</button>
+            <button class="seg-btn" data-stack="provider">Provider</button>
+            <button class="seg-btn" data-stack="project">Project</button>
+            <button class="seg-btn" data-stack="model">Model</button>
+            <button class="seg-btn" data-stack="bucket">Token Type</button>
+            <button class="seg-btn" data-stack="actor">Role</button>
+          </div>
+          <div class="seg-group" id="chart-grain-group">
+            <button class="seg-btn active" data-grain="day">Daily</button>
+            <button class="seg-btn" data-grain="week">Weekly</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="chart-wrap" id="timeline-wrap">
+        <svg class="chart-svg" id="timeline-svg"></svg>
+      </div>
+      <div class="chart-legend" id="timeline-legend"></div>
+    </section>
+
+    <!-- Token Anatomy + Subagent Swarm Split -->
+    <div class="grid-2">
+      <section class="panel">
+        <div class="panel-header">
+          <div>
+            <h2 class="panel-title">Normalized Token Anatomy</h2>
+            <p class="panel-subtitle">Mutually exclusive buckets harmonized across Anthropic, OpenAI, Google &amp; OpenCode schemas</p>
+          </div>
+        </div>
+        <div class="comp-bar" id="anatomy-bar"></div>
+        <div class="bucket-list" id="anatomy-buckets"></div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-header">
+          <div>
+            <h2 class="panel-title">Execution Role &amp; Day-of-Week Cadence</h2>
+            <p class="panel-subtitle">Click a role (`subagent`, `main`, `auto_review`) to cross-filter everything</p>
+          </div>
+        </div>
+        <div class="role-rows" id="actor-rows"></div>
+        <div class="dow-grid" id="dow-grid"></div>
+      </section>
+    </div>
+
+    <!-- Harness + Provider Side-by-Side -->
+    <div class="grid-equal">
+      <section class="panel">
+        <div class="panel-header">
+          <div>
+            <h2 class="panel-title">By Harness</h2>
+            <p class="panel-subtitle">Click a harness row to filter the observatory</p>
+          </div>
+        </div>
+        <div class="table-wrap" id="harness-table-wrap"></div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-header">
+          <div>
+            <h2 class="panel-title">By Model Ecosystem / Provider</h2>
+            <p class="panel-subtitle">Cloud frontier labs vs local self-hosted GPU</p>
+          </div>
+        </div>
+        <div class="table-wrap" id="provider-table-wrap"></div>
+      </section>
+    </div>
+
+    <!-- Model Breakdown Table -->
+    <section class="panel">
+      <div class="panel-header">
+        <div>
+          <h2 class="panel-title">By Model</h2>
+          <p class="panel-subtitle">Click any column header to sort · Click a model row to filter</p>
+        </div>
+        <div class="control-group">
+          <input type="search" id="model-search" placeholder="Filter models…" />
+        </div>
+      </div>
+      <div class="table-wrap" id="model-table-wrap"></div>
+    </section>
+
+    <!-- Project Breakdown Table -->
+    <section class="panel">
+      <div class="panel-header">
+        <div>
+          <h2 class="panel-title">By Project / Workspace</h2>
+          <p class="panel-subtitle">Git worktrees &amp; subagent shards automatically rolled up to canonical repos</p>
+        </div>
+        <div class="control-group">
+          <label class="checkbox-pill">
+            <input type="checkbox" id="chk-show-paths" />
+            Show mapped directories
+          </label>
+        </div>
+      </div>
+      <div class="table-wrap" id="project-table-wrap"></div>
+    </section>
+
+    <!-- Cross-Tab Heatmap Matrix -->
+    <section class="panel">
+      <div class="panel-header">
+        <div>
+          <h2 class="panel-title">Cross-Dimension Heatmap Matrix</h2>
+          <p class="panel-subtitle">Where projects, harnesses, and models intersect (scaled by active Primary Metric)</p>
+        </div>
+        <div class="seg-group" id="matrix-mode-group">
+          <button class="seg-btn active" data-matrix="project_harness">Project × Harness</button>
+          <button class="seg-btn" data-matrix="project_model">Project × Top Models</button>
+          <button class="seg-btn" data-matrix="harness_model">Harness × Top Models</button>
+        </div>
+      </div>
+      <div class="table-wrap" id="matrix-wrap"></div>
+    </section>
+
+    <!-- Heavyweight Sessions Explorer -->
+    <section class="panel">
+      <div class="panel-header">
+        <div>
+          <h2 class="panel-title">Heavyweight Sessions &amp; Subagent Runs</h2>
+          <p class="panel-subtitle" id="sessions-subtitle">Top individual threads &amp; runs matching active filters</p>
+        </div>
+        <div class="control-group">
+          <input type="search" id="session-search" placeholder="Search session title, project, model…" />
+        </div>
+      </div>
+      <div class="table-wrap" id="sessions-table-wrap"></div>
+    </section>
+
+    <!-- Data Source Health & Repeatability -->
+    <section class="panel">
+      <div class="panel-header">
+        <div>
+          <h2 class="panel-title">Local Telemetry Sources &amp; Repeatability</h2>
+          <p class="panel-subtitle">Read-only extraction with SQLite mtime/size cache — zero PyPI or npm packages</p>
+        </div>
+        <div class="mono" style="font-size: 12px; color: var(--text-muted)">
+          CLI: <code>token-stats</code> · <code>token-stats summary</code> · <code>token-stats extract</code>
+        </div>
+      </div>
+      <div class="health-grid" id="health-grid"></div>
+    </section>
+  </div>
+
+  <!-- Tooltip -->
+  <div class="chart-tooltip" id="chart-tooltip" hidden></div>
+
+  <!-- Toast -->
+  <div class="toast" id="toast" hidden></div>
+
+  <!-- Editable Billing & Overages Ledger Modal -->
+  <div class="modal-backdrop" id="billing-modal" hidden>
+    <div class="modal-box modal-box-wide" role="dialog" aria-modal="true" aria-labelledby="billing-modal-title">
+      <div class="modal-header">
+        <div>
+          <h3 id="billing-modal-title" style="margin: 0; font-size: 16px;">Actual Out-of-Pocket Billing &amp; Overage Ledger</h3>
+          <p style="margin: 3px 0 0; font-size: 12px; color: var(--text-muted);">
+            Combines exact log-extracted telemetry (Codex credit packs &amp; plan tiers, OpenCode promo offset, Claude start date &amp; Aug snapshot)
+            with inferred plan transitions and editable overage amounts. Saved locally across CLI &amp; browser.
+          </p>
+        </div>
+        <button id="btn-close-billing">✕</button>
+      </div>
+      <div class="modal-body">
+        <div class="table-wrap" id="billing-ledger-table-wrap"></div>
+        <div style="margin-top: 12px;">
+          <button id="btn-add-billing-item">+ Add Custom Subscription / Overage Entry</button>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button id="btn-reset-billing">Reset to Extracted &amp; Calibrated Defaults</button>
+        <div style="display: flex; gap: 8px;">
+          <button id="btn-save-billing" class="btn-primary">Apply &amp; Save Billing Ledger</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Editable API Rate Card Modal -->
+  <div class="modal-backdrop" id="rates-modal" hidden>
+    <div class="modal-box" role="dialog" aria-modal="true" aria-labelledby="rates-modal-title">
+      <div class="modal-header">
+        <div>
+          <h3 id="rates-modal-title" style="margin: 0; font-size: 16px;">API-Equivalent Rate Card ($ per 1M tokens)</h3>
+          <p style="margin: 3px 0 0; font-size: 12px; color: var(--text-muted);">
+            Most local usage runs on flat-rate subscriptions (Claude, Codex, Antigravity) or local self-hosted GPU.
+            Customize $/1M list rates below (saved in <code>localStorage</code>) to estimate API-equivalent value.
+          </p>
+        </div>
+        <button id="btn-close-rates">✕</button>
+      </div>
+      <div class="modal-body">
+        <div class="table-wrap" id="rates-table-wrap"></div>
+      </div>
+      <div class="modal-footer">
+        <button id="btn-reset-rates">Reset to Calibrated Defaults</button>
+        <div style="display: flex; gap: 8px;">
+          <button id="btn-save-rates" class="btn-primary">Apply &amp; Save Rates</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script src="./data.js"></script>
+  <script src="./app.js"></script>
+</body>
+</html>
