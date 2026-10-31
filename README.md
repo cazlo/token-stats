@@ -73,9 +73,11 @@ The payload carries a compact `cube_hourly` table alongside the daily `cube`: ea
 
 Every session in **Heavyweight Sessions & Subagent Runs** links to `session.html`, a call-by-call view of that session together with its subagents (and Codex forks / auto-reviews):
 
-- **Token Burn Over Time** — stacked by agent, token type or model, per interval or cumulative.
+- **Token Burn Over Time** — stacked by agent, token type, model or reasoning effort, per interval or cumulative.
 - **Agent Lanes** — when the main session and each subagent were active, with dashed connectors where a subagent was spawned.
 - **Context Size per Call** — prompt size on every call per agent, with ▼ marking sharp drops (usually compactions).
 - **Agents** table — calls, tokens, est. $, peak context and drops per agent for the visible window.
+
+Reasoning effort is shown per call, per agent and for the whole session where the harness logs it: Claude Code (`perTurnEffort` / `effort` on each assistant entry) and Codex (`turn_context` effort, falling back to the thread's `reasoning_effort`). OpenCode and Antigravity show it as *not logged*.
 
 Drag across any chart to zoom all of them to a time window; click a lane, legend entry or table row to focus one agent. Each session group is written to git-ignored `web/sessions/<id>.js` during extraction (unchanged files are not rewritten), so the page also works offline via `file://`.

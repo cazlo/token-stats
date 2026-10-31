@@ -18,7 +18,7 @@ Guidance for AI coding agents working in this repo. See `README.md` for what the
 
 - If you change what a worker parses or what gets stored in the parse cache, bump `CACHE_SCHEMA_VERSION` so existing caches re-parse.
 - Cube column order is a contract between `token_stats.py` (`cube_columns`, `cube_hourly_columns`) and the `C_*` constants in `web/app.js`. Change both together; append columns rather than reorder.
-- Each extractor also returns `timelines` (`{session_id: {parent, calls: [[epoch_ms, model, inp, cr, cw, out, reas, cost], ...]}}`); `build_session_details` groups them by root session into `web/sessions/<id>.js` and sets each session's `detail` id.
+- Each extractor also returns `timelines` (`{session_id: {parent, calls: [[epoch_ms, model, inp, cr, cw, out, reas, cost, effort], ...]}}`, `effort` = reasoning-effort level or `""` when not logged); `build_session_details` groups them by root session into `web/sessions/<id>.js` and sets each session's `detail` id.
 - Cube keys inside extractors use a local `YYYY-MM-DDTHH` bucket (bare date when the hour is unknown); `extract_all` splits them into the daily and hourly cubes.
 - The date range can have hour-level edges (`state.hourFrom` / `state.hourTo`). Panels must aggregate `scopeRows().filter(rowMatches)` rather than `rawData.cube` directly, so partial first/last days come from hourly rows.
 - Chart colors live in `PALETTES` in `web/common.js` (dark + light), with harness/provider colors mirrored as `--c-*` variables in `styles.css`. Keep them in sync, and check new categorical colors for distinctness (including colour-blind separation) in both themes.

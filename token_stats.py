@@ -62,7 +62,7 @@ SESSION_DETAIL_MANIFEST_PATH = DATA_DIR / "session_details_manifest.json"
 HOME = Path.home()
 LOCAL_TZ = dt.datetime.now().astimezone().tzinfo
 
-CACHE_SCHEMA_VERSION = "8"
+CACHE_SCHEMA_VERSION = "9"
 EXTRACT_LOCK = threading.Lock()
 _LOCAL_CFG_CACHE: tuple[int, dict[str, Any]] | None = None
 
@@ -191,7 +191,10 @@ def to_epoch_ms(ts: Any) -> int:
 
 
 def new_timelines() -> dict[str, dict[str, Any]]:
-    """Per-session call timelines: {session_id: {"parent": parent_session_id, "calls": [[ms, model, inp, cr, cw, out, reas, cost], ...]}}."""
+    """Per-session call timelines: {session_id: {"parent": parent_session_id, "calls": [[ms, model, inp, cr, cw, out, reas, cost, effort], ...]}}.
+
+    `effort` is the model's reasoning-effort level for that call ("low", "high", ...) or "" when the harness doesn't log it.
+    """
     return defaultdict(lambda: {"parent": "", "calls": []})
 
 
@@ -531,6 +534,8 @@ def _parse_claude_file(path: str) -> dict[str, Any]:
                 actor = "subagent" if (is_sub or o.get("isSidechain")) else "main"
                 model = m.get("model") or "unknown"
                 has_stop = 1 if m.get("stop_reason") else 0
+                # Claude Code logs the session effort setting and the effective per-turn effort
+                effort = str(o.get("perTurnEffort") or o.get("effort") or "")
 
                 # Handle Anthropic server-side model fallback (`usage.iterations` with `fallback_message`)
                 iters = u.get("iterations")
@@ -550,10 +555,10 @@ def _parse_claude_file(path: str) -> dict[str, Any]:
                         it_model = str(it.get("model") or model)
                         it_reas = reas if idx_it == len(iters) - 1 and reas <= it_out else 0
                         sub_recs.append(
-                            [f"{mid}#iter{idx_it}", it_model, ts, cwd, actor, it_in, it_cr, it_cw, max(0, it_out - it_reas), it_reas, has_stop]
+                            [f"{mid}#iter{idx_it}", it_model, ts, cwd, actor, it_in, it_cr, it_cw, max(0, it_out - it_reas), it_reas, has_stop, effort]
                         )
                 if not sub_recs:
-                    sub_recs = [[mid, model, ts, cwd, actor, inp, cr, cw, max(0, out_tot - reas), reas, has_stop]]
+                    sub_recs = [[mid, model, ts, cwd, actor, inp, cr, cw, max(0, out_tot - reas), reas, has_stop, effort]]
 
                 tot_out = sum(r[8] + r[9] for r in sub_recs)
                 tot_all = sum(r[5] + r[6] + r[7] + r[8] + r[9] for r in sub_recs)
@@ -697,7 +702,8 @@ def extract_claude(cache_con: sqlite3.Connection, pool: ProcessPoolExecutor | No
         b[3] += cw
         b[4] += out_txt
         b[5] += reas
-        timelines[sid]["calls"].append([to_epoch_ms(ts), model, inp, cr, cw, out_txt, reas, 0.0])
+        call_effort = str(rec[10]) if len(rec) > 10 else ""
+        timelines[sid]["calls"].append([to_epoch_ms(ts), model, inp, cr, cw, out_txt, reas, 0.0, call_effort])
 
         s = sess_acc.get(sid)
         if s is None:
@@ -880,6 +886,7 @@ def _parse_codex_rollout(path: str) -> dict[str, Any]:
     """
     opener = zstd.open if path.endswith(".zst") else open
     cur_model = ""
+    cur_effort = ""
     cur_cwd = ""
     meta_info: dict[str, Any] = {}
     compacted_totals: set[int] = set()
@@ -934,6 +941,9 @@ def _parse_codex_rollout(path: str) -> dict[str, Any]:
                             pl = ev.get("payload") or {}
                             if pl.get("model"):
                                 cur_model = pl["model"]
+                            eff = pl.get("effort") or pl.get("reasoning_effort")
+                            if eff:
+                                cur_effort = str(eff)
                             if pl.get("cwd") and not cur_cwd:
                                 cur_cwd = pl["cwd"]
                     except Exception:
@@ -1015,6 +1025,7 @@ def _parse_codex_rollout(path: str) -> dict[str, Any]:
                                 l_tot,
                                 is_comp_base,
                                 str(ev.get("timestamp") or ""),
+                                cur_effort,
                             ]
                         )
                     except Exception:
@@ -1295,6 +1306,7 @@ def extract_codex(cache_con: sqlite3.Connection, pool: ProcessPoolExecutor | Non
                     is_comp_base,
                 ) = ev[:15]
                 ev_ts = ev[15] if len(ev) > 15 else ""
+                ev_effort = (ev[16] if len(ev) > 16 else "") or str(_effort or "")
                 cum6 = (c_in, c_cr, c_cw, c_out, c_reas, c_tot)
 
                 # Skip inherited parent prefix turns or compaction header baseline records
@@ -1344,7 +1356,7 @@ def extract_codex(cache_con: sqlite3.Connection, pool: ProcessPoolExecutor | Non
                 b[5] += d_reas
                 tl = timelines[tid]
                 tl["parent"] = tl_parent
-                tl["calls"].append([to_epoch_ms(ev_ts), model_id, uncached_in, d_cr, d_cw, out_txt, d_reas, 0.0])
+                tl["calls"].append([to_epoch_ms(ev_ts), model_id, uncached_in, d_cr, d_cw, out_txt, d_reas, 0.0, ev_effort])
 
                 mp = (model_id, provider)
                 mp_toks[mp] += turn_sum
@@ -1827,7 +1839,7 @@ def extract_opencode(cache_con: sqlite3.Connection) -> dict[str, Any]:
         key = (eff_key, "OpenCode", provider, model, proj, actor, 0)
         tl = timelines[sid]
         tl["parent"] = meta.get("parent_id") or ""
-        tl["calls"].append([int(ts_ms or 0), model, inp, cr, cw, out_txt, reas, float(cost or 0.0)])
+        tl["calls"].append([int(ts_ms or 0), model, inp, cr, cw, out_txt, reas, float(cost or 0.0), ""])
         b = cube_acc[key]
         b[0] += 1
         b[1] += inp
@@ -2423,7 +2435,7 @@ def extract_antigravity(cache_con: sqlite3.Connection, pool: ProcessPoolExecutor
             key = (eff_key, "Antigravity", provider, model, proj, actor, 0)
             tl = timelines[cid]
             tl["parent"] = meta.get("parent_cid") or payload.get("parent_cid") or ""
-            tl["calls"].append([to_epoch_ms(ts_val), model, inp, cr, cw, out_txt, reas, 0.0])
+            tl["calls"].append([to_epoch_ms(ts_val), model, inp, cr, cw, out_txt, reas, 0.0, ""])
             b = cube_acc[key]
             b[0] += 1
             b[1] += inp
@@ -2998,12 +3010,20 @@ def build_session_details(
         t0 = calls_all[0][0]
         models: list[str] = []
         model_idx: dict[str, int] = {}
+        efforts: list[str] = []
+        effort_idx: dict[str, int] = {}
         rows = []
-        for ms, _o, (sid, _ms, model, inp, cr, cw, out_txt, reas, cost) in calls_all:
+        for ms, _o, (sid, _ms, model, inp, cr, cw, out_txt, reas, cost, *rest) in calls_all:
+            effort = str(rest[0]) if rest else ""
             if model not in model_idx:
                 model_idx[model] = len(models)
                 models.append(model)
-            rows.append([ms - t0, agent_idx[sid], model_idx[model], inp, cr, cw, out_txt, reas, round(float(cost), 6)])
+            if effort not in effort_idx:
+                effort_idx[effort] = len(efforts)
+                efforts.append(effort)
+            rows.append(
+                [ms - t0, agent_idx[sid], model_idx[model], inp, cr, cw, out_txt, reas, round(float(cost), 6), effort_idx[effort]]
+            )
         total_calls += len(rows)
 
         agents = []
@@ -3030,9 +3050,13 @@ def build_session_details(
             "t0": t0,
             "untimed_calls": untimed,
             "models": models,
+            "efforts": efforts,
             "rates": {m: default_rates.get(m) for m in models if default_rates.get(m)},
             "agents": agents,
-            "call_columns": ["dt_ms", "agent", "model", "input_uncached", "cache_read", "cache_write", "output_text", "reasoning", "logged_cost_usd"],
+            "call_columns": [
+                "dt_ms", "agent", "model", "input_uncached", "cache_read", "cache_write",
+                "output_text", "reasoning", "logged_cost_usd", "effort",
+            ],
             "calls": rows,
         }
         body = json.dumps(detail, separators=(",", ":"))

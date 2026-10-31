@@ -117,7 +117,7 @@
   display: flex;
   align-items: center;
   gap: 7px;
-  max-width: 360px;
+  max-width: 290px;
 }
 
 .agent-cell span:last-child {

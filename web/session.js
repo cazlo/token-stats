@@ -9,7 +9,7 @@
   let PALETTE = T.PALETTES.dark;
 
   // Call row columns (see "call_columns" in the detail file)
-  const K_DT = 0, K_AGENT = 1, K_MODEL = 2, K_IN = 3, K_CR = 4, K_CW = 5, K_OUT = 6, K_REAS = 7;
+  const K_DT = 0, K_AGENT = 1, K_MODEL = 2, K_IN = 3, K_CR = 4, K_CW = 5, K_OUT = 6, K_REAS = 7, K_EFFORT = 9;
 
   const TOP_AGENTS = 10;
   const PAD_L = 160; // shared left gutter so every chart's time axis lines up
@@ -31,6 +31,8 @@
   let agentInTop = [];
   let agentParentIdx = [];
   let agentModels = []; // per agent: [[model, calls], ...] over the whole session, most-used first
+  let agentEfforts = []; // per agent: [[effort, calls], ...] over the whole session, most-used first
+  let effortLevels = []; // effort levels present in this session, lowest -> highest ("" = not logged, last)
   let callEst = null; // Float64Array of est $ per call (recomputed when rates change)
   let brushing = false; // a drag-to-zoom is in progress
   let lastBrushAt = 0; // when the last drag-to-zoom finished (so it isn't also treated as a click)
@@ -69,6 +71,29 @@
 
   function fmtMetric(v, metric = state.metric) {
     return metric === "est_cost" ? fmtUsd(v) : fmtTok(v);
+  }
+
+  // Reasoning effort for a call ("" when the harness doesn't log it; older detail files lack the column)
+  function effortOf(c) {
+    return (D.efforts && D.efforts[c[K_EFFORT]]) || "";
+  }
+
+  function fmtEffort(e) {
+    return e || "not logged";
+  }
+
+  function effortColor(e) {
+    if (!e) return PALETTE.other;
+    const known = effortLevels.filter((x) => x);
+    const ramp = PALETTE.effort;
+    const j = known.indexOf(e);
+    if (known.length <= 1 || j < 0) return ramp[Math.floor(ramp.length / 2)];
+    return ramp[Math.round((j * (ramp.length - 1)) / (known.length - 1))];
+  }
+
+  // "high (120) / medium (4)" style summary of [[label, count], ...]
+  function fmtCounts(list, fmt = (x) => x) {
+    return list.length > 1 ? list.map(([k, n]) => `${esc(fmt(k))} (${n})`).join("<br/>") : esc(fmt((list[0] || [""])[0]));
   }
 
   function promptOf(c) {
@@ -240,6 +265,17 @@
       [...m.entries()].sort((a, b) => b[1] - a[1]).map(([mi, cnt]) => [D.models[mi], cnt])
     );
 
+    const effortCounts = [...Array(n)].map(() => new Map());
+    const levels = new Set();
+    for (const c of D.calls) {
+      const e = effortOf(c);
+      levels.add(e);
+      const m = effortCounts[c[K_AGENT]];
+      m.set(e, (m.get(e) || 0) + 1);
+    }
+    effortLevels = [...levels].sort((a, b) => (a === "") - (b === "") || T.effortRank(a) - T.effortRank(b) || a.localeCompare(b));
+    agentEfforts = effortCounts.map((m) => [...m.entries()].sort((a, b) => b[1] - a[1]));
+
     const idxById = new Map(D.agents.map((a, i) => [a.id, i]));
     agentParentIdx = D.agents.map((a) => (a.parent && idxById.has(a.parent) ? idxById.get(a.parent) : -1));
 
@@ -259,7 +295,7 @@
       idx: i,
       calls: 0, inp: 0, cr: 0, cw: 0, out: 0, reas: 0, est: 0,
       first: Infinity, last: -Infinity, peak: 0, compactions: 0,
-      models: new Set(), prevPrompt: 0,
+      models: new Set(), efforts: new Map(), prevPrompt: 0,
     }));
     D.calls.forEach((c, i) => {
       const s = st[c[K_AGENT]];
@@ -279,6 +315,8 @@
       s.peak = Math.max(s.peak, p);
       if (isDrop) s.compactions++;
       s.models.add(D.models[c[K_MODEL]]);
+      const e = effortOf(c);
+      s.efforts.set(e, (s.efforts.get(e) || 0) + 1);
     });
     for (const s of st) {
       s.total = s.inp + s.cr + s.cw + s.out + s.reas;
@@ -308,6 +346,7 @@
       <span><strong>${subs}</strong> subagent${subs === 1 ? "" : "s"}</span>
       <span><strong>${D.calls.length.toLocaleString()}</strong> calls</span>
       <span class="mono" style="font-size:11.5px">${esc(D.models.join(", "))}</span>
+      <span>Effort <strong>${esc(effortLevels.map(fmtEffort).join(" · "))}</strong></span>
       ${D.untimed_calls ? `<span>${D.untimed_calls.toLocaleString()} calls without timestamps not shown</span>` : ""}
     `;
   }
@@ -430,6 +469,7 @@
     const keyOf = (i) => {
       const c = D.calls[i];
       if (state.stack === "model") return D.models[c[K_MODEL]];
+      if (state.stack === "effort") return fmtEffort(effortOf(c));
       const a = c[K_AGENT];
       return agentInTop[a] ? `a${a}` : "Other";
     };
@@ -460,6 +500,9 @@
     } else if (state.stack === "bucket") {
       const order = ["Cache Read", "Cache Write", "Uncached Input", "Text Output", "Reasoning"];
       keys.sort((a, b) => order.indexOf(a) - order.indexOf(b));
+    } else if (state.stack === "effort") {
+      const order = effortLevels.map(fmtEffort);
+      keys.sort((a, b) => order.indexOf(a) - order.indexOf(b));
     } else {
       keys.sort((a, b) => D.models.indexOf(a) - D.models.indexOf(b));
     }
@@ -468,6 +511,7 @@
     const colorOf = (k) => {
       if (state.stack === "agent") return k === "Other" ? PALETTE.other : agentColor[Number(k.slice(1))];
       if (state.stack === "bucket") return PALETTE.bucket[k] || PALETTE.other;
+      if (state.stack === "effort") return effortColor(effortLevels.find((e) => fmtEffort(e) === k) || "");
       return PALETTE.series[D.models.indexOf(k) % PALETTE.series.length];
     };
     const labelOf = (k) => {
@@ -675,6 +719,7 @@
               ? agentModels[i].map(([m, cnt]) => `${esc(m)} (${cnt})`).join("<br/>")
               : esc((agentModels[i][0] || [a.model])[0])
           }</span></div>
+          <div class="tt-row"><span>${agentEfforts[i].length > 1 ? "Efforts" : "Effort"}</span><span class="mono" style="text-align:right">${fmtCounts(agentEfforts[i], fmtEffort)}</span></div>
           <div class="tt-row"><span>Active</span><span class="num">${esc(fmtClock(f, true))} → ${esc(fmtClock(l, true))} (${esc(fmtDuration(l - f))})</span></div>
           ${i > 0 ? `<div class="tt-row"><span>Spawned by</span><span>${esc(parent)}</span></div>` : ""}
           <div class="tt-row"><span>Calls in window</span><span class="num">${s.calls.toLocaleString()}</span></div>
@@ -796,6 +841,7 @@
       tooltip.innerHTML = `
         <div class="tt-title"><span><span class="swatch" style="background:${agentColor[c[K_AGENT]]};margin-right:6px;"></span>${esc(agentLabel(c[K_AGENT], 40))}</span></div>
         <div class="tt-row"><span>${esc(fmtDateTime(c[K_DT]))}</span><span class="mono">${esc(D.models[c[K_MODEL]])}</span></div>
+        <div class="tt-row"><span>Effort</span><span class="mono">${esc(fmtEffort(effortOf(c)))}</span></div>
         <div class="tt-row"><span>Prompt (context)</span><span class="num"><strong>${fmtTok(promptOf(c))}</strong></span></div>
         <div class="tt-row"><span>· cache read / write</span><span class="num">${fmtTok(c[K_CR])} / ${fmtTok(c[K_CW])}</span></div>
         <div class="tt-row"><span>· uncached input</span><span class="num">${fmtTok(c[K_IN])}</span></div>
@@ -826,6 +872,14 @@
             <td><div class="agent-cell"><span class="dot" style="background:${agentColor[s.idx]}"></span><span title="${esc(a.title)}">${esc(agentLabel(s.idx, 70))}</span></div></td>
             <td><span class="badge"><span class="dot" style="background:${aCol}"></span>${esc(a.actor)}</span></td>
             <td class="mono" style="font-size:11.5px;white-space:nowrap" title="${esc([...s.models].join(", "))}">${esc([...s.models][0] || a.model)}${s.models.size > 1 ? ` <span style="color:var(--text-dim)">+${s.models.size - 1}</span>` : ""}</td>
+            <td class="mono" style="font-size:11.5px;white-space:nowrap" title="${esc([...s.efforts].map(([e, n]) => `${fmtEffort(e)}: ${n} calls`).join(", "))}">${
+              s.efforts.size
+                ? (() => {
+                    const ranked = [...s.efforts].sort((x, y) => y[1] - x[1]);
+                    return esc(fmtEffort(ranked[0][0])) + (ranked.length > 1 ? ` <span style="color:var(--text-dim)">+${ranked.length - 1}</span>` : "");
+                  })()
+                : "—"
+            }</td>
             <td class="num" style="white-space:nowrap">${has ? esc(fmtClock(s.first, true)) : "—"}</td>
             <td class="num" style="white-space:nowrap">${has ? esc(fmtDuration(s.last - s.first)) : "—"}</td>
             <td class="right num">${s.calls.toLocaleString()}</td>
@@ -842,7 +896,7 @@
     wrap.innerHTML = `
       <table class="data-table">
         <thead><tr>
-          <th>Agent</th><th>Role</th><th>Model</th><th>Start</th><th>Span</th>
+          <th>Agent</th><th>Role</th><th>Model</th><th>Effort</th><th>Start</th><th>Span</th>
           <th class="right">Calls</th><th class="right">Fresh/Active</th><th class="right">Cache Read</th>
           <th class="right">Out+Reason</th><th class="right">Total</th><th class="right">Est. $</th>
           <th class="right">Peak Ctx</th><th class="right">Drops</th>

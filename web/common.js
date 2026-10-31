@@ -45,6 +45,8 @@
       other: "#64748b",
       // GitHub-style activity ramp: empty cell + 4 intensity steps (one hue, dim -> bright)
       heat: ["#1a2131", "#173f73", "#1f62b3", "#3987e5", "#9ec5f4"],
+      // Ordinal ramp for reasoning-effort levels, lowest -> highest (one hue, brighter = more effort)
+      effort: ["#256abf", "#3987e5", "#6da7ec", "#9ec5f4", "#cde2fb"],
     },
     light: {
       harness: {
@@ -80,8 +82,18 @@
       ],
       other: "#94a3b8",
       heat: ["#eef2f8", "#b7d3f6", "#6da7ec", "#2a78d6", "#104281"],
+      // Ordinal ramp for reasoning-effort levels, lowest -> highest (one hue, darker = more effort)
+      effort: ["#86b6ef", "#5598e7", "#2a78d6", "#1c5cab", "#0d366b"],
     },
   };
+
+  // Reasoning-effort levels as harnesses log them, lowest to highest
+  const EFFORT_ORDER = ["none", "minimal", "low", "medium", "high", "xhigh", "max"];
+
+  function effortRank(e) {
+    const i = EFFORT_ORDER.indexOf(String(e || "").toLowerCase());
+    return i < 0 ? EFFORT_ORDER.length : i;
+  }
 
   const STORAGE_RATES_KEY = "token_obs_rates_v1";
   const STORAGE_THEME_KEY = "token_obs_theme_v1";
@@ -135,6 +147,8 @@
 
   window.TokenObs = {
     PALETTES,
+    EFFORT_ORDER,
+    effortRank,
     STORAGE_RATES_KEY,
     STORAGE_THEME_KEY,
     fmtTok,
