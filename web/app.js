@@ -838,7 +838,7 @@
       state.filters.provider || state.filters.model || state.filters.project || state.filters.actor
     );
 
-    const hNames = ["Claude Code", "Codex", "OpenCode", "Antigravity"];
+    const hNames = ["Claude Code", "Codex", "OpenCode", "Antigravity", "GitHub Copilot"];
     const hMap = new Map();
     for (const nm of hNames) hMap.set(nm, emptyAgg(nm));
     for (const r of dimRows) {
@@ -937,19 +937,29 @@
     const cw = bill.codex_wallet || {};
     const ct = bill.claude_telemetry || {};
     const ot = bill.opencode_telemetry || {};
+    const copt = bill.copilot_telemetry || {};
     const topCodexProj = Object.entries(cw.burns_by_project_usd || {})
       .slice(0, 3)
       .map(([p, v]) => `${esc(p)} (${fmtUsd(v)})`)
       .join(", ");
     const aug = ct.aug_snapshot || null;
+    const snaps = Array.isArray(ct.snapshots) && ct.snapshots.length > 0 ? ct.snapshots : aug ? [aug] : [];
     const codexSegSummary = (cw.plan_segments || [])
       .map((s) => `<strong>${esc(s.plan_type)}</strong> (${esc(s.start_date)}..${esc(s.end_date)})`)
       .join(" → ");
-    const claudeSnapText = aug
-      ? `Snapshot (${esc(aug.date || "cached")}) logged <strong>$${Number(aug.used_credits_usd || 0).toFixed(2)}/$${Number(aug.monthly_limit_usd || 0).toFixed(0)}</strong> Extra Usage` +
-        (aug.seven_day_pct != null ? ` (<code>seven_day: ${aug.seven_day_pct}%</code>)` : "") +
-        ". "
-      : "";
+    const claudeSnapText =
+      snaps.length > 1
+        ? `Snapshots logged ${snaps
+            .map(
+              (sn) =>
+                `${esc(sn.date || "cached")}: <strong>$${Number(sn.used_credits_usd || 0).toFixed(2)}/$${Number(sn.monthly_limit_usd || 0).toFixed(0)}</strong>`
+            )
+            .join(" · ")} Extra Usage. `
+        : aug
+          ? `Snapshot (${esc(aug.date || "cached")}) logged <strong>$${Number(aug.used_credits_usd || 0).toFixed(2)}/$${Number(aug.monthly_limit_usd || 0).toFixed(0)}</strong> Extra Usage` +
+            (aug.seven_day_pct != null ? ` (<code>seven_day: ${aug.seven_day_pct}%</code>)` : "") +
+            ". "
+          : "";
     const claudeStepText = ct.inferred_upgrade_week
       ? `Week of <strong>${esc(ct.inferred_upgrade_week)}</strong> stepped from ~${fmtUsd(ct.pre_upgrade_weekly_api_usd || 0)}/wk to ~${fmtUsd(ct.post_upgrade_weekly_api_usd || 0)}/wk API-equiv. `
       : "";
@@ -957,6 +967,14 @@
     const agPaidSum = effLedger
       .filter((it) => it.harness === "Antigravity")
       .reduce((acc, it) => acc + Number(it.amount_usd || 0), 0);
+    const copPaidSum = effLedger
+      .filter((it) => it.harness === "GitHub Copilot")
+      .reduce((acc, it) => acc + Number(it.amount_usd || 0), 0);
+    const copPremReqs = Number(copt.premium_requests || 0);
+    const hasCopTelemetry =
+      copPremReqs > 0 ||
+      copPaidSum > 0 ||
+      Number(copt.cli_sessions || 0) + Number(copt.jetbrains_sessions || 0) + Number(copt.vscode_sessions || 0) > 0;
 
     forensicsWrap.innerHTML = `
       <div class="forensic-card">
@@ -986,7 +1004,9 @@
         <div class="forensic-head">
           <span>
             <span class="dot" style="background:var(--c-opencode);margin-right:4px;"></span>
-            <span class="dot" style="background:var(--c-antigravity);margin-right:6px;"></span>OpenCode &amp; Antigravity
+            <span class="dot" style="background:var(--c-antigravity);margin-right:${hasCopTelemetry ? "4px" : "6px"};"></span>${
+              hasCopTelemetry ? `<span class="dot" style="background:var(--c-copilot);margin-right:6px;"></span>OpenCode, Antigravity &amp; Copilot` : `OpenCode &amp; Antigravity`
+            }
           </span>
           <span class="src-pill src-user_calibrated">Ledger</span>
         </div>
@@ -996,7 +1016,11 @@
               ? `<strong>${fmtUsd(ot.session_header_promo_usd || ot.promo_anthropic_usd || 0)}</strong> promotional credits absorbed ($0 paid)`
               : `<strong>${fmtUsd(ot.direct_paid_usd || 0)}</strong> direct API spend`
           }; local self-hosted GPU runs at $0.
-          <strong>Antigravity:</strong> <strong>${fmtUsd(agPaidSum)}</strong> attributed across active ledger periods.
+          <strong>Antigravity:</strong> <strong>${fmtUsd(agPaidSum)}</strong> attributed across active ledger periods.${
+            hasCopTelemetry
+              ? ` <strong>Copilot:</strong> <strong>${copPremReqs.toLocaleString(undefined, { maximumFractionDigits: 1 })}</strong> premium requests logged (${fmtUsd(copPaidSum)} attributed).`
+              : ""
+          }
         </div>
       </div>
     `;
@@ -2417,7 +2441,7 @@
     if (!modal || !wrap) return;
 
     const rows = Array.isArray(draftRows) ? draftRows : getEffectiveLedger();
-    const harnesses = ["Claude Code", "Codex", "OpenCode", "Antigravity"];
+    const harnesses = ["Claude Code", "Codex", "OpenCode", "Antigravity", "GitHub Copilot"];
 
     wrap.innerHTML = `
       <div id="billing-modal-live-summary" style="display:flex;flex-wrap:wrap;gap:18px;padding:9px 12px;margin-bottom:10px;border-radius:7px;background:var(--bg-subtle);border:1px solid var(--border);font-size:12.5px;color:var(--text-muted);"></div>

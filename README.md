@@ -41,6 +41,9 @@ You can also open `web/index.html` directly via `file://` in any browser without
 | **Codex** | `~/.codex/state_5.sqlite` + `~/.codex/sessions/**/*.jsonl[.zst]` + `archived_sessions/` | Decompresses `.jsonl.zst` via Python 3.14 `compression.zstd`, strips inherited parent prefix/compaction turns from forked subagents & `guardian` auto-reviews, recovers pre-restart tokens, and reconstructs exact `rate_limits.plan_type` cycles and `credits.balance` wallet purchases & turn-by-turn credit burns (`$0.04/credit`). |
 | **OpenCode** | `~/.local/share/opencode/opencode.db` | Streaming-safe per-session signature sync across `session_v2`, `message` (v1), and `session_message` (v2 + v1->v2 hybrid continuations), tracking direct API spend, promotional credit offsets, and local self-hosted GPU models (`$0`). |
 | **Antigravity** | `~/.gemini/antigravity/conversations/*.db` + `antigravity-ide/conversations/*.db` + `conversation_summaries.db` | Decodes `gen_metadata` & `steps` protobuf blobs directly from trajectory SQLite DBs (WAL-aware), recovering exact per-generation API model slugs, historical turns, and Gemini `thinking_tokens`. |
+| **GitHub Copilot** | `~/.copilot/state/session-store.db` + `~/.copilot/session-state/*/events.jsonl` + `~/.copilot/jb/*/partition-*.jsonl` (`$COPILOT_HOME`) + VS Code / Insiders / VSCodium `chatSessions/*.{jsonl,json}` + `logs/**/GitHub Copilot Chat.log` | Extracts per-call tokens, subagent lanes, reasoning effort, and premium request multipliers from Copilot CLI's SQLite store & `events.jsonl` (reconciling multi-process `session.resume` / `session.shutdown` `modelMetrics`), reconstructs JetBrains Copilot agent/subagent conversations (`jb/`), replays VS Code `chatSessions` (including per-round `toolCallRounds` context growth, `subAgentInvocationId` streams, and migrated-workspace deduplication), and extracts plan SKUs from `GitHub Copilot Chat.log`. |
+
+Archived backup directories containing `.claude`, `.codex`, `.codex-bak`, `.copilot`, or `.config*` (`Code/User`) subdirectories can also be merged seamlessly without double-counting via `backup_roots` in `data/local_config.json` or `$TOKEN_STATS_BACKUP_DIR`.
 
 ## Actual Out-of-Pocket Billing & Overage Ledger
 
@@ -48,7 +51,7 @@ In addition to list-rate API-equivalent valuation, the observatory builds an **A
 
 - **Codex (`Extracted Exact`)**: Reconstructs `plan_type` billing cycles (`plus`, `prolite`, `pro`, `team`) and exact `500`-credit (`$20`) wallet purchases + turn-level burns from non-forked `rate_limits.credits.balance` telemetry.
 - **Claude Code (`Extracted + Inferred + Editable`)**: Combines `subscriptionCreatedAt` and `cachedUsageUtilization` from `~/.claude.json` with weekly API-equivalent quota step-ups (`Max 5x` → `Max 20x`) and burst overage weighting. Any line item (such as Stripe Extra Usage totals) can be customized in the UI and persists locally to git-ignored `data/billing_overrides.json` (`POST /api/billing`) and `localStorage`.
-- **OpenCode & Antigravity**: Supports logged direct API spend, promotional credit offsets (`$0` paid), local GPU (`$0`), and custom monthly plan schedules via the UI or optional git-ignored `data/local_config.json`.
+- **OpenCode, Antigravity & GitHub Copilot**: Supports logged direct API spend, promotional credit offsets (`$0` paid), local GPU (`$0`), Copilot premium request multipliers (`$0.04/premium request` on overage), and custom monthly plan schedules via the UI or optional git-ignored `data/local_config.json`.
 
 ## Harmonized Token Accounting
 
@@ -78,6 +81,6 @@ Every session in **Heavyweight Sessions & Subagent Runs** links to `session.html
 - **Context Size per Call** — prompt size on every call per agent, with ▼ marking sharp drops (usually compactions).
 - **Agents** table — calls, tokens, est. $, peak context and drops per agent for the visible window.
 
-Reasoning effort is shown per call, per agent and for the whole session where the harness logs it: Claude Code (`perTurnEffort` / `effort` on each assistant entry) and Codex (`turn_context` effort, falling back to the thread's `reasoning_effort`). OpenCode and Antigravity show it as *not logged*.
+Reasoning effort is shown per call, per agent and for the whole session where the harness logs it: Claude Code (`perTurnEffort` / `effort` on each assistant entry), Codex (`turn_context` effort, falling back to the thread's `reasoning_effort`), and GitHub Copilot (`reasoning_effort` / `reasoningBucket`). OpenCode and Antigravity show it as *not logged*.
 
 Drag across any chart to zoom all of them to a time window; click a lane, legend entry or table row to focus one agent. Each session group is written to git-ignored `web/sessions/<id>.js` during extraction (unchanged files are not rewritten), so the page also works offline via `file://`.

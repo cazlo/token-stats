@@ -6,10 +6,11 @@ Zero third-party dependencies (100% Python 3.14+ standard library, including
 `compression.zstd`, `sqlite3`, `concurrent.futures`, and `http.server`).
 
 Supported local harnesses discovered on this machine:
-  1. Claude Code  (~/.claude/projects/**/*.jsonl + pre-cleanup ~/.claude/stats-cache.json)
-  2. Codex        (~/.codex/state_5.sqlite + ~/.codex/sessions/**/*.jsonl[.zst] + archived_sessions)
-  3. OpenCode     (~/.local/share/opencode/opencode.db: session_v2 + message + session_message)
-  4. Antigravity  (~/.gemini/antigravity/conversations/*.db + antigravity-ide + brain/* fallback)
+  1. Claude Code     (~/.claude/projects/**/*.jsonl + pre-cleanup ~/.claude/stats-cache.json)
+  2. Codex           (~/.codex/state_5.sqlite + ~/.codex/sessions/**/*.jsonl[.zst] + archived_sessions)
+  3. OpenCode        (~/.local/share/opencode/opencode.db: session_v2 + message + session_message)
+  4. Antigravity     (~/.gemini/antigravity/conversations/*.db + antigravity-ide + brain/* fallback)
+  5. GitHub Copilot  (~/.copilot/state/session-store.db + session-state/*/events.jsonl + VS Code chatSessions)
 
 Usage:
   token-stats [--port 8765] [--open]  # Refresh logs, print summary & serve web UI (default)
@@ -62,7 +63,7 @@ SESSION_DETAIL_MANIFEST_PATH = DATA_DIR / "session_details_manifest.json"
 HOME = Path.home()
 LOCAL_TZ = dt.datetime.now().astimezone().tzinfo
 
-CACHE_SCHEMA_VERSION = "9"
+CACHE_SCHEMA_VERSION = "12"
 EXTRACT_LOCK = threading.Lock()
 _LOCAL_CFG_CACHE: tuple[int, dict[str, Any]] | None = None
 
@@ -84,6 +85,36 @@ def load_local_config() -> dict[str, Any]:
         cfg = {}
     _LOCAL_CFG_CACHE = (st.st_mtime_ns, cfg)
     return cfg
+
+
+def get_backup_roots() -> list[Path]:
+    """
+    Return optional backup log root directories (configured via `backup_roots` in
+    `data/local_config.json` or `$TOKEN_STATS_BACKUP_DIR`).
+    """
+    home_str = str(HOME)
+    raw_candidates: list[str] = []
+    env_b = os.environ.get("TOKEN_STATS_BACKUP_DIR") or ""
+    if env_b.strip():
+        for part in env_b.split(os.pathsep):
+            if part.strip():
+                raw_candidates.append(part.strip())
+    cfg = load_local_config()
+    for item in cfg.get("backup_roots") or []:
+        if isinstance(item, str) and item.strip():
+            raw_candidates.append(item.strip().replace("{HOME}", home_str))
+
+    out: list[Path] = []
+    seen: set[str] = set()
+    for rc in raw_candidates:
+        p = Path(rc).expanduser()
+        if not p.is_dir():
+            continue
+        key = str(p.resolve())
+        if key not in seen and key != str(HOME.resolve()):
+            seen.add(key)
+            out.append(p)
+    return out
 
 
 def _atomic_write_text(path: Path, content: str) -> None:
@@ -109,7 +140,7 @@ def _file_sig(path: str) -> tuple[int, int] | None:
         return None
     mtime_ns = st.st_mtime_ns
     size = st.st_size
-    if path.endswith(".db"):
+    if path.endswith((".db", ".sqlite", ".sqlite3")):
         try:
             wst = os.stat(path + "-wal")
             if wst.st_size > 0:
@@ -256,11 +287,15 @@ def normalize_project(raw_path: str | None) -> tuple[str, str]:
     if not raw_path:
         return ("(unassigned)", "")
     p = raw_path.strip()
-    if p.startswith("file://"):
+    if p.startswith(("file://", "vscode-remote://")):
         p = unquote(urlparse(p).path)
     p = p.rstrip("/")
+    if p.endswith(".code-workspace"):
+        p = p[:-15].rstrip("/")
     if not p or p == "/":
         return ("(global / root)", p or "/")
+    if "/.config/" in p and (p.endswith("/workspace.json") or p.endswith("/agent-sessions")):
+        return ("(unassigned)", "")
 
     cleaned = p
     for marker in ("/.claude/worktrees/", "/.worktrees/", "/worktrees/"):
@@ -339,28 +374,41 @@ AG_ENUM_TO_MODEL: dict[int, str] = {
 }
 
 
+PREVIEW_SUFFIX_RE = re.compile(r"\s*\(preview\)\s*", re.IGNORECASE)
+DATE_STAMP_SUFFIX_RE = re.compile(r"-(?:20\d{2}-\d{2}-\d{2}|20\d{6})$")
+
+
 def normalize_model_and_provider(raw_model: str | None, raw_provider: str | None = None, harness: str = "") -> tuple[str, str]:
     """Return canonical (model_id, provider_label) harmonized across all harnesses."""
     m = (raw_model or "").strip()
     prov = (raw_provider or "").strip().lower()
+    if prov in ("github-copilot", "copilot"):
+        prov = ""
 
     if not m or m == "<synthetic>":
         m = "(unknown)"
     else:
+        for v_pref in ("github-copilot/", "copilot/"):
+            if m.lower().startswith(v_pref):
+                m = m[len(v_pref) :].strip()
+                break
         ml_check = m.lower()
         if ml_check in AG_MODEL_ALIASES:
             m = AG_MODEL_ALIASES[ml_check]
         else:
-            stripped = EFFORT_SUFFIX_RE.sub("", m).strip()
+            stripped = PREVIEW_SUFFIX_RE.sub(" ", EFFORT_SUFFIX_RE.sub("", m)).strip()
             sl = stripped.lower()
             if sl in AG_MODEL_ALIASES:
                 m = AG_MODEL_ALIASES[sl]
-            elif sl.startswith("claude "):
+            elif sl in ("oswe-vscode-prime", "raptor mini", "raptor-mini"):
+                m = "raptor-mini"
+            elif sl.startswith("claude ") or sl.startswith("claude-"):
                 m = re.sub(r"[\s.]+", "-", sl)
-            elif sl.startswith("gemini "):
+            elif sl.startswith(("gemini ", "gpt ", "gpt-", "grok ")):
                 m = re.sub(r"\s+", "-", sl)
             else:
                 m = stripped
+            m = re.sub(r"-preview$", "", DATE_STAMP_SUFFIX_RE.sub("", m), flags=re.IGNORECASE)
             cm = CLAUDE_EFFORT_SLUG_RE.match(m)
             if cm:
                 m = cm.group(1).lower()
@@ -377,10 +425,16 @@ def normalize_model_and_provider(raw_model: str | None, raw_provider: str | None
         provider = "Local / Self-Hosted GPU"
     elif prov == "anthropic" or "claude" in ml:
         provider = "Anthropic"
-    elif prov in ("openai", "custom-gateway") or ml.startswith(("gpt-", "o1", "o3", "o4", "codex-")):
+    elif prov in ("openai", "custom-gateway") or ml.startswith(("gpt-", "o1", "o3", "o4", "codex-", "raptor-", "oswe-")):
         provider = "OpenAI"
     elif prov in ("google", "gemini") or "gemini" in ml:
         provider = "Google"
+    elif prov == "xai" or "grok" in ml:
+        provider = "xAI"
+    elif prov in ("moonshot", "moonshotai") or "kimi" in ml:
+        provider = "Moonshot AI"
+    elif prov in ("microsoft", "azure") or ml.startswith("mai-"):
+        provider = "Microsoft"
     else:
         if harness == "Claude Code":
             provider = "Anthropic"
@@ -590,18 +644,54 @@ def _parse_claude_file(path: str) -> dict[str, Any]:
     }
 
 
+def _iso_to_utc_date(iso_str: str | None) -> str:
+    if not iso_str:
+        return "unknown"
+    s = iso_str.strip()
+    if len(s) >= 10 and s[4] == "-" and s[7] == "-":
+        try:
+            if s.endswith("Z"):
+                s = s[:-1] + "+00:00"
+            parsed = dt.datetime.fromisoformat(s)
+            if parsed.tzinfo is not None:
+                parsed = parsed.astimezone(dt.timezone.utc)
+            return parsed.strftime("%Y-%m-%d")
+        except ValueError:
+            return s[:10]
+    return "unknown"
+
+
 def extract_claude(cache_con: sqlite3.Connection, pool: ProcessPoolExecutor | None) -> dict[str, Any]:
     t0 = time.time()
     claude_dir = HOME / ".claude"
-    proj_dir = claude_dir / "projects"
-    # Deterministic order: main session files before /subagents/, then lexicographic path
-    jfiles = (
-        sorted(
-            glob.glob(str(proj_dir / "**" / "*.jsonl"), recursive=True),
-            key=lambda p: (1 if "/subagents/" in p else 0, p),
-        )
-        if proj_dir.exists()
-        else []
+    primary_prefix = str(claude_dir.resolve()) + os.sep
+    claude_dirs: list[Path] = []
+    seen_cdirs: set[str] = set()
+    for cd in [claude_dir, *[b / ".claude" for b in get_backup_roots()]]:
+        if cd.is_dir():
+            rk = str(cd.resolve())
+            if rk not in seen_cdirs:
+                seen_cdirs.add(rk)
+                claude_dirs.append(cd)
+
+    # Deterministic order: main session files before /subagents/, live ~/.claude before backups on ties
+    raw_jfiles: list[str] = []
+    seen_jpaths: set[str] = set()
+    for cd in claude_dirs:
+        pdir = cd / "projects"
+        if pdir.is_dir():
+            for jf in glob.glob(str(pdir / "**" / "*.jsonl"), recursive=True):
+                rj = str(Path(jf).resolve())
+                if rj not in seen_jpaths:
+                    seen_jpaths.add(rj)
+                    raw_jfiles.append(jf)
+    jfiles = sorted(
+        raw_jfiles,
+        key=lambda p: (
+            1 if "/subagents/" in p else 0,
+            0 if str(Path(p).resolve()).startswith(primary_prefix) else 1,
+            p,
+        ),
     )
 
     cached_rows = {
@@ -643,13 +733,20 @@ def extract_claude(cache_con: sqlite3.Connection, pool: ProcessPoolExecutor | No
         cache_con.commit()
 
     _prune_file_cache(cache_con, "claude", active_paths, set(cached_rows.keys()))
-    parsed_payloads.sort(key=lambda item: (1 if "/subagents/" in item[0] else 0, item[0]))
+    parsed_payloads.sort(
+        key=lambda item: (
+            1 if "/subagents/" in item[0] else 0,
+            0 if str(Path(item[0]).resolve()).startswith(primary_prefix) else 1,
+            item[0],
+        )
+    )
 
     # Global deduplication across all Claude JSONL files by message.id
-    global_calls: dict[str, tuple[str, list[Any]]] = {}
+    global_calls: dict[str, tuple[str, list[Any], bool]] = {}
     session_meta: dict[str, dict[str, Any]] = {}
 
-    for _path, payload in parsed_payloads:
+    for path, payload in parsed_payloads:
+        is_primary = str(Path(path).resolve()).startswith(primary_prefix)
         sid = payload["session_id"]
         if sid not in session_meta:
             session_meta[sid] = {
@@ -669,7 +766,7 @@ def extract_claude(cache_con: sqlite3.Connection, pool: ProcessPoolExecutor | No
             prev = global_calls.get(mid)
             # Strict `>` on cross-file ties keeps deterministic first-seen main session owner
             if prev is None or _claude_rec_rank(rec) > _claude_rec_rank(prev[1]):
-                global_calls[mid] = (sid, rec)
+                global_calls[mid] = (sid, rec, is_primary)
 
     cube_acc: dict[tuple[str, str, str, str, str, str, int], list[float]] = defaultdict(
         lambda: [0, 0, 0, 0, 0, 0, 0.0]
@@ -677,18 +774,25 @@ def extract_claude(cache_con: sqlite3.Connection, pool: ProcessPoolExecutor | No
     sess_acc: dict[str, dict[str, Any]] = {}
     min_live_date = "9999-99-99"
     max_live_date = "0000-00-00"
+    min_primary_live_date = "9999-99-99"
+    covered_utc_dates: set[str] = set()
     project_raw_paths: dict[str, set[str]] = defaultdict(set)
 
     timelines = new_timelines()
-    for sid, rec in global_calls.values():
+    for sid, rec, is_primary in global_calls.values():
         model_raw, ts, cwd, actor, inp, cr, cw, out_txt, reas = rec[:9]
         hour_key = iso_to_local_hour_key(ts)
         date_str = hour_key_date(hour_key)
+        utc_d = _iso_to_utc_date(ts)
+        if utc_d != "unknown":
+            covered_utc_dates.add(utc_d)
         if date_str != "unknown":
             if date_str < min_live_date:
                 min_live_date = date_str
             if date_str > max_live_date:
                 max_live_date = date_str
+            if is_primary and date_str < min_primary_live_date:
+                min_primary_live_date = date_str
         proj, clean_path = normalize_project(cwd)
         if clean_path:
             project_raw_paths[proj].add(clean_path)
@@ -752,10 +856,13 @@ def extract_claude(cache_con: sqlite3.Connection, pool: ProcessPoolExecutor | No
         s.pop("_mp_toks", None)
         s.pop("_mp_max_date", None)
 
-    # Pre-cleanup ~/.claude/stats-cache.json ONLY for dates < min_live_date
-    sc_path = claude_dir / "stats-cache.json"
+    # Pre-cleanup ~/.claude/stats-cache.json ONLY for gap UTC dates not already covered by .jsonl files
     archived_days = 0
-    if sc_path.exists():
+    seen_sc_dates: set[str] = set()
+    for cd in claude_dirs:
+        sc_path = cd / "stats-cache.json"
+        if not sc_path.exists():
+            continue
         try:
             sc = json.loads(sc_path.read_text(encoding="utf-8"))
             model_usage = sc.get("modelUsage") or {}
@@ -772,8 +879,14 @@ def extract_claude(cache_con: sqlite3.Connection, pool: ProcessPoolExecutor | No
             daily_act = {d["date"]: d for d in (sc.get("dailyActivity") or []) if "date" in d}
             for entry in sc.get("dailyModelTokens") or []:
                 d_str = entry.get("date") or ""
-                if not d_str or d_str >= min_live_date:
+                if (
+                    not d_str
+                    or d_str in covered_utc_dates
+                    or d_str in seen_sc_dates
+                    or d_str >= min_primary_live_date
+                ):
                     continue
+                seen_sc_dates.add(d_str)
                 archived_days += 1
                 tbm = entry.get("tokensByModel") or {}
                 day_msgs = int((daily_act.get(d_str) or {}).get("messageCount") or len(tbm))
@@ -798,7 +911,7 @@ def extract_claude(cache_con: sqlite3.Connection, pool: ProcessPoolExecutor | No
         except Exception:
             pass
 
-    # Extract strictly non-sensitive subscription & Extra Usage metadata from ~/.claude.json
+    # Extract strictly non-sensitive subscription & Extra Usage metadata from ~/.claude.json (+ backups)
     claude_billing_meta: dict[str, Any] = {
         "billing_type": "",
         "subscription_created_date": "",
@@ -807,41 +920,58 @@ def extract_claude(cache_con: sqlite3.Connection, pool: ProcessPoolExecutor | No
         "fable_overage_models": [],
         "fable_migration_date": "",
         "aug_snapshot": None,
+        "snapshots": [],
     }
-    cj_path = HOME / ".claude.json"
-    if cj_path.exists():
+    cj_candidates: list[Path] = []
+    if (HOME / ".claude.json").is_file():
+        cj_candidates.append(HOME / ".claude.json")
+    for cd in claude_dirs:
+        if (cd.parent / ".claude.json").is_file() and (cd.parent / ".claude.json") not in cj_candidates:
+            cj_candidates.append(cd.parent / ".claude.json")
+        bdir = cd / "backups"
+        if bdir.is_dir():
+            cj_candidates.extend(sorted(bdir.glob(".claude.json.backup*"), reverse=True))
+
+    snap_by_date: dict[str, dict[str, Any]] = {}
+    for cj_path in cj_candidates:
         try:
             cj = json.loads(cj_path.read_text(encoding="utf-8", errors="replace"))
+            if not isinstance(cj, dict):
+                continue
             oauth = cj.get("oauthAccount") or {}
             if isinstance(oauth, dict):
-                claude_billing_meta["billing_type"] = str(oauth.get("billingType") or "")
-                claude_billing_meta["subscription_created_date"] = iso_to_local_date(
-                    oauth.get("subscriptionCreatedAt")
-                )
-                claude_billing_meta["extra_usage_enabled"] = bool(oauth.get("hasExtraUsageEnabled"))
+                if not claude_billing_meta["billing_type"] and oauth.get("billingType"):
+                    claude_billing_meta["billing_type"] = str(oauth.get("billingType") or "")
+                if not claude_billing_meta["subscription_created_date"] and oauth.get("subscriptionCreatedAt"):
+                    claude_billing_meta["subscription_created_date"] = iso_to_local_date(
+                        oauth.get("subscriptionCreatedAt")
+                    )
+                if oauth.get("hasExtraUsageEnabled"):
+                    claude_billing_meta["extra_usage_enabled"] = True
             fov = cj.get("fableOverageConsentV2")
-            if isinstance(fov, dict):
-                claude_billing_meta["fable_overage_consent"] = any(bool(v) for v in fov.values())
+            if isinstance(fov, dict) and any(bool(v) for v in fov.values()):
+                claude_billing_meta["fable_overage_consent"] = True
             gb = cj.get("cachedGrowthBookFeatures") or {}
-            if isinstance(gb, dict):
+            if isinstance(gb, dict) and not claude_billing_meta["fable_overage_models"]:
                 inc = gb.get("tengu_usage_overage_included_models")
                 if isinstance(inc, list):
                     claude_billing_meta["fable_overage_models"] = [str(x) for x in inc]
             fmig = cj.get("fable5ToFableAliasMigrationTimestamp")
-            if isinstance(fmig, (int, float)) and fmig > 0:
+            if isinstance(fmig, (int, float)) and fmig > 0 and not claude_billing_meta["fable_migration_date"]:
                 claude_billing_meta["fable_migration_date"] = epoch_to_local_date(fmig)
             cu = cj.get("cachedUsageUtilization")
-            if isinstance(cu, dict):
-                eu = cu.get("extra_usage") or {}
+            if isinstance(cu, dict) and cu.get("fetchedAtMs"):
                 ut = cu.get("utilization") or {}
+                eu = cu.get("extra_usage") or ut.get("extra_usage") or {}
                 fable_scoped_pct = None
                 for lim in cu.get("limits") or []:
                     if isinstance(lim, dict):
                         mname = (((lim.get("scope") or {}).get("model") or {}).get("display_name") or "")
                         if "fable" in str(mname).lower():
                             fable_scoped_pct = lim.get("percent")
-                claude_billing_meta["aug_snapshot"] = {
-                    "date": epoch_to_local_date(cu.get("fetchedAtMs")),
+                s_date = epoch_to_local_date(cu.get("fetchedAtMs"))
+                snap_obj = {
+                    "date": s_date,
                     "extra_usage_enabled": bool(eu.get("is_enabled")),
                     "monthly_limit_usd": round(float(eu.get("monthly_limit") or 0) / 100.0, 2),
                     "used_credits_usd": round(float(eu.get("used_credits") or 0) / 100.0, 2),
@@ -849,8 +979,14 @@ def extract_claude(cache_con: sqlite3.Connection, pool: ProcessPoolExecutor | No
                     "seven_day_pct": (ut.get("seven_day") or {}).get("utilization"),
                     "fable_weekly_pct": fable_scoped_pct,
                 }
+                prev_s = snap_by_date.get(s_date)
+                if prev_s is None or snap_obj["used_credits_usd"] > prev_s["used_credits_usd"]:
+                    snap_by_date[s_date] = snap_obj
+                if claude_billing_meta["aug_snapshot"] is None:
+                    claude_billing_meta["aug_snapshot"] = snap_obj
         except Exception:
             pass
+    claude_billing_meta["snapshots"] = [snap_by_date[k] for k in sorted(snap_by_date.keys())]
 
     elapsed_ms = round((time.time() - t0) * 1000, 1)
     return {
@@ -1045,19 +1181,32 @@ def _parse_codex_rollout(path: str) -> dict[str, Any]:
     }
 
 
-def _resolve_codex_rollout_file(rollout_path: str, archived_by_name: dict[str, str]) -> str | None:
+def _resolve_codex_rollout_file(
+    rollout_path: str, codex_dir: Path, archived_by_name: dict[str, str]
+) -> str | None:
     if not rollout_path:
         return None
-    if os.path.exists(rollout_path):
-        return rollout_path
-    zpath = rollout_path + ".zst"
-    if os.path.exists(zpath):
-        return zpath
+    # Prefer resolving relative to `codex_dir` first so relocated backup roots resolve to their own files
+    for marker in ("/sessions/", "/archived_sessions/"):
+        if marker in rollout_path:
+            rel = rollout_path.split(marker, 1)[1]
+            sub = marker.strip("/")
+            cand = codex_dir / sub / rel
+            if cand.exists():
+                return str(cand)
+            cand_z = Path(str(cand) + ".zst")
+            if cand_z.exists():
+                return str(cand_z)
     base = os.path.basename(rollout_path)
     if base in archived_by_name:
         return archived_by_name[base]
     if (base + ".zst") in archived_by_name:
         return archived_by_name[base + ".zst"]
+    if os.path.exists(rollout_path):
+        return rollout_path
+    zpath = rollout_path + ".zst"
+    if os.path.exists(zpath):
+        return zpath
     return None
 
 
@@ -1075,49 +1224,110 @@ def _iso_to_epoch_ms(iso_str: str | None) -> int:
 
 def extract_codex(cache_con: sqlite3.Connection, pool: ProcessPoolExecutor | None) -> dict[str, Any]:
     t0 = time.time()
-    codex_dir = HOME / ".codex"
-    db_path = codex_dir / "state_5.sqlite"
-    if not db_path.exists() and not (codex_dir / "sessions").exists():
+    codex_dirs: list[Path] = []
+    seen_codex_dirs: set[Path] = set()
+    for cand in [
+        HOME / ".codex",
+        HOME / ".codex-bak",
+        *[b / sub for b in get_backup_roots() for sub in (".codex", ".codex-bak")],
+    ]:
+        if not cand.is_dir():
+            continue
+        try:
+            rp = cand.resolve()
+        except OSError:
+            rp = cand
+        if rp not in seen_codex_dirs:
+            seen_codex_dirs.add(rp)
+            codex_dirs.append(cand)
+
+    has_any_source = any(
+        (d / "state_5.sqlite").exists() or (d / "sessions").exists() or (d / "archived_sessions").exists()
+        for d in codex_dirs
+    )
+    if not has_any_source:
         return {"cube": {}, "sessions": [], "project_paths": {}, "health": {"harness": "Codex", "files_total": 0}}
 
     threads_by_id: dict[str, tuple[Any, ...]] = {}
-    if db_path.exists():
-        con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
-        for row in con.execute(
-            """
-            SELECT id, rollout_path, created_at, updated_at, source, model_provider,
-                   cwd, title, tokens_used, model, reasoning_effort, agent_role,
-                   thread_source, attached_thread_parent_id
-            FROM threads
-            """
-        ):
-            threads_by_id[row[0]] = row
-        con.close()
-
-    arch_dir = codex_dir / "archived_sessions"
-    archived_by_name: dict[str, str] = {}
-    if arch_dir.exists():
-        for entry in sorted(os.listdir(arch_dir)):
-            archived_by_name[entry] = str(arch_dir / entry)
-
-    thread_files: dict[str, str] = {}
+    candidates_by_tid: dict[str, list[str]] = defaultdict(list)
     referenced_paths: set[str] = set()
-    for tid, row in threads_by_id.items():
-        actual = _resolve_codex_rollout_file(row[1], archived_by_name)
-        if actual:
-            thread_files[tid] = actual
-            referenced_paths.add(actual)
+    disk_rollouts: list[str] = []
 
-    # Also discover orphan rollout files on disk not listed in state_5.sqlite
-    sess_dir = codex_dir / "sessions"
-    disk_rollouts = []
-    if sess_dir.exists():
-        disk_rollouts.extend(sorted(glob.glob(str(sess_dir / "**" / "*.jsonl*"), recursive=True)))
-    if arch_dir.exists():
-        disk_rollouts.extend(sorted(glob.glob(str(arch_dir / "*.jsonl*"))))
+    wanted_cols = (
+        "id",
+        "rollout_path",
+        "created_at",
+        "updated_at",
+        "source",
+        "model_provider",
+        "cwd",
+        "title",
+        "tokens_used",
+        "model",
+        "reasoning_effort",
+        "agent_role",
+        "thread_source",
+        "attached_thread_parent_id",
+    )
 
+    for cdir in codex_dirs:
+        arch_dir = cdir / "archived_sessions"
+        archived_by_name: dict[str, str] = {}
+        if arch_dir.exists():
+            for entry in sorted(os.listdir(arch_dir)):
+                archived_by_name[entry] = str(arch_dir / entry)
+
+        db_path = cdir / "state_5.sqlite"
+        if db_path.exists():
+            try:
+                con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+                tables = {
+                    r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+                }
+                spawn_parents: dict[str, str] = {}
+                if "thread_spawn_edges" in tables:
+                    e_cols = {
+                        r[1] for r in con.execute("PRAGMA table_info(thread_spawn_edges)").fetchall()
+                    }
+                    if {"parent_thread_id", "child_thread_id"}.issubset(e_cols):
+                        for p_id, ch_id in con.execute(
+                            "SELECT parent_thread_id, child_thread_id FROM thread_spawn_edges"
+                        ):
+                            if ch_id and p_id:
+                                spawn_parents[str(ch_id)] = str(p_id)
+
+                if "threads" in tables:
+                    t_cols = {r[1] for r in con.execute("PRAGMA table_info(threads)").fetchall()}
+                    sel_exprs = [c if c in t_cols else f"NULL AS {c}" for c in wanted_cols]
+                    for raw_row in con.execute(f"SELECT {', '.join(sel_exprs)} FROM threads"):
+                        tid = str(raw_row[0] or "")
+                        if not tid:
+                            continue
+                        parent_val = str(raw_row[13] or spawn_parents.get(tid) or "")
+                        norm_row = (*raw_row[:13], parent_val)
+                        if tid not in threads_by_id:
+                            threads_by_id[tid] = norm_row
+                        elif not threads_by_id[tid][13] and parent_val:
+                            prev_r = threads_by_id[tid]
+                            threads_by_id[tid] = (*prev_r[:13], parent_val)
+
+                        actual = _resolve_codex_rollout_file(str(raw_row[1] or ""), cdir, archived_by_name)
+                        if actual:
+                            referenced_paths.add(actual)
+                            if actual not in candidates_by_tid[tid]:
+                                candidates_by_tid[tid].append(actual)
+                con.close()
+            except sqlite3.Error:
+                pass
+
+        sess_dir = cdir / "sessions"
+        if sess_dir.exists():
+            disk_rollouts.extend(sorted(glob.glob(str(sess_dir / "**" / "*.jsonl*"), recursive=True)))
+        if arch_dir.exists():
+            disk_rollouts.extend(sorted(glob.glob(str(arch_dir / "*.jsonl*"))))
+
+    # Also discover orphan rollout files on disk (or unreferenced candidate rollouts for known threads)
     orphan_files: list[str] = []
-    seen_orphan_stems: set[str] = set()
     for p in disk_rollouts:
         if p in referenced_paths:
             continue
@@ -1128,13 +1338,11 @@ def extract_codex(cache_con: sqlite3.Connection, pool: ProcessPoolExecutor | Non
             stem = name[:-6]
         else:
             continue
-        if stem in seen_orphan_stems:
-            continue
-        # Check if stem's UUID is already in thread_files
         maybe_tid = stem[-36:] if len(stem) >= 36 else stem
-        if maybe_tid in thread_files:
+        if maybe_tid in threads_by_id:
+            if p not in candidates_by_tid[maybe_tid]:
+                candidates_by_tid[maybe_tid].append(p)
             continue
-        seen_orphan_stems.add(stem)
         orphan_files.append(p)
 
     cached_rows = {
@@ -1144,7 +1352,9 @@ def extract_codex(cache_con: sqlite3.Connection, pool: ProcessPoolExecutor | Non
         )
     }
 
-    all_rollout_paths = sorted(set(thread_files.values()) | set(orphan_files))
+    all_rollout_paths = sorted(
+        {p for cands in candidates_by_tid.values() for p in cands} | set(orphan_files)
+    )
     to_parse_map: dict[str, tuple[int, int]] = {}
     file_payloads: dict[str, dict[str, Any]] = {}
     active_paths: set[str] = set()
@@ -1188,6 +1398,8 @@ def extract_codex(cache_con: sqlite3.Connection, pool: ProcessPoolExecutor | Non
         name = os.path.basename(opath)
         stem = name[:-10] if name.endswith(".jsonl.zst") else name[:-6]
         tid = m_info.get("id") or (stem[-36:] if len(stem) >= 36 else stem)
+        if opath not in candidates_by_tid[tid]:
+            candidates_by_tid[tid].append(opath)
         if tid in threads_by_id:
             continue
         created_ms = _iso_to_epoch_ms(m_info.get("timestamp"))
@@ -1207,7 +1419,16 @@ def extract_codex(cache_con: sqlite3.Connection, pool: ProcessPoolExecutor | Non
             m_info.get("thread_source") or "",
             m_info.get("parent_thread_id") or m_info.get("forked_from_id") or "",
         )
-        thread_files[tid] = opath
+
+    # Pick the richest rollout file per thread (recovering pre-compaction turns from backups while tie-breaking to live)
+    thread_files: dict[str, str] = {}
+    for tid, cands in candidates_by_tid.items():
+        valid_cands = [p for p in cands if p in file_payloads]
+        if valid_cands:
+            thread_files[tid] = max(
+                valid_cands,
+                key=lambda p: len((file_payloads[p].get("events")) or []),
+            )
 
     def _classify_codex_actor(row: tuple[Any, ...], payload: dict[str, Any] | None) -> str:
         src_str = str(row[4] or "")
@@ -1417,7 +1638,9 @@ def extract_codex(cache_con: sqlite3.Connection, pool: ProcessPoolExecutor | Non
     CODEX_PLAN_MONTHLY_USD = {"plus": 20.0, "prolite": 100.0, "pro": 200.0, "team": 30.0}
 
     main_rl_samples: list[list[Any]] = []
-    for _fpath, pl_rl in file_payloads.items():
+    seen_rl_keys: set[tuple[Any, Any, Any]] = set()
+    for fpath in sorted(set(thread_files.values())):
+        pl_rl = file_payloads.get(fpath)
         if not pl_rl:
             continue
         mi = pl_rl.get("meta") or {}
@@ -1432,7 +1655,10 @@ def extract_codex(cache_con: sqlite3.Connection, pool: ProcessPoolExecutor | Non
         ):
             continue
         for s_row in pl_rl.get("rl_samples") or []:
-            main_rl_samples.append(s_row)
+            rl_key = (s_row[0], s_row[1], s_row[2])
+            if rl_key not in seen_rl_keys:
+                seen_rl_keys.add(rl_key)
+                main_rl_samples.append(s_row)
 
     main_rl_samples.sort(key=lambda r: r[0])
 
@@ -1828,6 +2054,8 @@ def extract_opencode(cache_con: sqlite3.Connection) -> dict[str, Any]:
         actor = meta["actor"]
         eff_m = m_id or meta["m_id"]
         eff_p = p_id or meta["p_id"]
+        is_sub_routed = (eff_p or "").strip().lower() in ("github-copilot", "copilot")
+        eff_cost = 0.0 if is_sub_routed else float(cost or 0.0)
         model, provider = normalize_model_and_provider(eff_m, eff_p, "OpenCode")
         eff_key = d_str if d_str != "unknown" else meta["date"]
         eff_date = hour_key_date(eff_key)
@@ -1839,7 +2067,7 @@ def extract_opencode(cache_con: sqlite3.Connection) -> dict[str, Any]:
         key = (eff_key, "OpenCode", provider, model, proj, actor, 0)
         tl = timelines[sid]
         tl["parent"] = meta.get("parent_id") or ""
-        tl["calls"].append([int(ts_ms or 0), model, inp, cr, cw, out_txt, reas, float(cost or 0.0), ""])
+        tl["calls"].append([int(ts_ms or 0), model, inp, cr, cw, out_txt, reas, eff_cost, ""])
         b = cube_acc[key]
         b[0] += 1
         b[1] += inp
@@ -1847,7 +2075,7 @@ def extract_opencode(cache_con: sqlite3.Connection) -> dict[str, Any]:
         b[3] += cw
         b[4] += out_txt
         b[5] += reas
-        b[6] += cost
+        b[6] += eff_cost
 
         sa = sess_msg_acc.get(sid)
         if sa is None:
@@ -1869,7 +2097,7 @@ def extract_opencode(cache_con: sqlite3.Connection) -> dict[str, Any]:
         sa["cw"] += cw
         sa["out"] += out_txt
         sa["reas"] += reas
-        sa["cost"] += cost
+        sa["cost"] += eff_cost
         mp = (model, provider)
         sa["mp_toks"][mp] += inp + cr + cw + out_txt + reas
         prev_d = sa["mp_max_date"].get(mp)
@@ -1905,6 +2133,8 @@ def extract_opencode(cache_con: sqlite3.Connection) -> dict[str, Any]:
         else:
             # Fallback only for compacted sessions with 0 live assistant rows
             t_in, t_cr, t_cw, t_out, t_reas, cost = meta["sv2_totals"]
+            if (meta["p_id"] or "").strip().lower() in ("github-copilot", "copilot"):
+                cost = 0.0
             if (t_in + t_cr + t_cw + t_out + t_reas) == 0 and cost == 0:
                 continue
             model, provider = normalize_model_and_provider(meta["m_id"], meta["p_id"], "OpenCode")
@@ -2507,6 +2737,1840 @@ def extract_antigravity(cache_con: sqlite3.Connection, pool: ProcessPoolExecutor
 
 
 # ---------------------------------------------------------------------------
+# 5. GitHub Copilot Extractor (Copilot CLI SQLite + events.jsonl + VS Code Chat)
+# ---------------------------------------------------------------------------
+
+
+def _parse_copilot_workspace_yaml(yaml_path: Path) -> dict[str, str]:
+    """Lightweight stdlib parser for flat key: value metadata in Copilot CLI workspace.yaml."""
+    out: dict[str, str] = {}
+    try:
+        text = yaml_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return out
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or ":" not in line:
+            continue
+        k, v = line.split(":", 1)
+        key = k.strip()
+        val = v.strip()
+        if len(val) >= 2 and ((val[0] == "'" and val[-1] == "'") or (val[0] == '"' and val[-1] == '"')):
+            val = val[1:-1]
+        if key and val and val not in ("null", "~"):
+            out[key] = val
+    return out
+
+
+def _distribute_int(total: int, weights: list[int]) -> list[int]:
+    """Deterministically distribute `total` into `len(weights)` non-negative integers summing to `total`."""
+    n = len(weights)
+    if n == 0 or total <= 0:
+        return [0] * n
+    w_sum = sum(weights)
+    if w_sum <= 0:
+        q, rem = divmod(total, n)
+        return [q + (1 if i < rem else 0) for i in range(n)]
+    out: list[int] = []
+    acc_w = 0
+    prev_alloc = 0
+    for w in weights:
+        acc_w += w
+        cur_alloc = (total * acc_w) // w_sum
+        out.append(cur_alloc - prev_alloc)
+        prev_alloc = cur_alloc
+    return out
+
+
+def _parse_copilot_cli_events(path_str: str) -> dict[str, Any]:
+    """
+    Worker: parse ~/.copilot/session-state/<id>/events.jsonl (+ sibling workspace.yaml &
+    vscode.requests.metadata.json). Handles multi-process `session.resume` -> `session.shutdown`
+    segments, distributing segment `modelMetrics` across `assistant.message` timestamps when
+    older Copilot CLI / VS Code Agent builds omit per-call `assistant.usage` events.
+    """
+    p = Path(path_str)
+    ws_meta = _parse_copilot_workspace_yaml(p.parent / "workspace.yaml")
+    sid = ws_meta.get("id") or p.parent.name
+    parent_sid = ""
+    cwd = ws_meta.get("cwd") or ws_meta.get("git_root") or ""
+    title = ws_meta.get("summary") or ws_meta.get("name") or ""
+    prompt_fallback = ""
+    start_time = ws_meta.get("created_at") or ""
+    last_ts = ws_meta.get("updated_at") or start_time
+
+    vsc_fallback_model = ""
+    vsc_req_meta = p.parent / "vscode.requests.metadata.json"
+    if vsc_req_meta.is_file():
+        try:
+            rm_list = json.loads(vsc_req_meta.read_text(encoding="utf-8", errors="replace"))
+            if isinstance(rm_list, list):
+                for item in rm_list:
+                    if isinstance(item, dict):
+                        cand_m = str(item.get("responseModelId") or "").strip()
+                        if cand_m and cand_m.lower() != "auto":
+                            vsc_fallback_model = cand_m
+                            break
+        except (OSError, ValueError):
+            pass
+
+    cur_model = vsc_fallback_model
+    default_effort = ""
+    segments: list[dict[str, Any]] = [
+        {"calls": [], "msgs": [], "shutdown_metrics": {}, "shutdown_ts": ""}
+    ]
+
+    try:
+        with open(path_str, "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                s = line.strip()
+                if not s:
+                    continue
+                try:
+                    ev = json.loads(s)
+                except ValueError:
+                    continue
+                if not isinstance(ev, dict):
+                    continue
+                etype = ev.get("type") or ""
+                ts = str(ev.get("timestamp") or "")
+                if ts:
+                    last_ts = ts
+                data = ev.get("data")
+                if not isinstance(data, dict):
+                    data = {}
+                seg = segments[-1]
+
+                if etype == "session.start":
+                    sid = str(data.get("sessionId") or sid)
+                    if data.get("startTime"):
+                        start_time = str(data["startTime"])
+                    sel_m = str(data.get("selectedModel") or "").strip()
+                    if sel_m and sel_m.lower() != "auto":
+                        cur_model = sel_m
+                    if data.get("reasoningEffort"):
+                        default_effort = str(data["reasoningEffort"]).lower()
+                    if data.get("detachedFromSpawningParentSessionId"):
+                        parent_sid = str(data["detachedFromSpawningParentSessionId"])
+                    ctx = data.get("context")
+                    if isinstance(ctx, dict) and not cwd:
+                        cwd = str(ctx.get("cwd") or ctx.get("gitRoot") or "")
+                elif etype == "session.resume":
+                    if seg["calls"] or seg["msgs"] or seg["shutdown_metrics"]:
+                        seg = {"calls": [], "msgs": [], "shutdown_metrics": {}, "shutdown_ts": ""}
+                        segments.append(seg)
+                    sel_m = str(data.get("selectedModel") or "").strip()
+                    if sel_m and sel_m.lower() != "auto":
+                        cur_model = sel_m
+                    ctx = data.get("context")
+                    if isinstance(ctx, dict) and not cwd:
+                        cwd = str(ctx.get("cwd") or ctx.get("gitRoot") or "")
+                elif etype == "session.context_changed":
+                    if not cwd:
+                        cwd = str(data.get("cwd") or data.get("gitRoot") or "")
+                elif etype == "session.model_change":
+                    new_m = str(data.get("newModel") or "").strip()
+                    if new_m and new_m.lower() != "auto":
+                        cur_model = new_m
+                elif etype == "session.title_changed":
+                    t_val = str(data.get("title") or "").strip()
+                    if t_val:
+                        title = t_val
+                elif etype == "user.message" and not prompt_fallback:
+                    c_val = data.get("content") or data.get("prompt") or ""
+                    if isinstance(c_val, str) and c_val.strip():
+                        prompt_fallback = c_val.strip()[:120]
+                elif etype == "assistant.message":
+                    msg_m = str(data.get("model") or "").strip()
+                    if msg_m and msg_m.lower() != "auto":
+                        cur_model = msg_m
+                    else:
+                        msg_m = cur_model
+                    out_w = max(0, int(data.get("outputTokens") or 0))
+                    eff = str(data.get("reasoningEffort") or default_effort or "").lower()
+                    sub_k = str(ev.get("agentId") or data.get("parentToolCallId") or "")
+                    seg["msgs"].append([ts or last_ts, msg_m, out_w, eff, sub_k])
+                elif etype == "assistant.usage":
+                    m_cand = str(data.get("model") or "").strip()
+                    if m_cand.lower() == "auto":
+                        m_cand = ""
+                    raw_m = m_cand or cur_model or vsc_fallback_model or "(unknown)"
+                    cr = max(0, int(data.get("cacheReadTokens") or 0))
+                    cw = max(0, int(data.get("cacheWriteTokens") or 0))
+                    raw_in = max(0, int(data.get("inputTokens") or 0))
+                    inp = max(0, raw_in - cr - cw)
+                    reas = max(0, int(data.get("reasoningTokens") or 0))
+                    raw_out = max(0, int(data.get("outputTokens") or 0))
+                    out_txt = max(0, raw_out - reas)
+                    if inp + cr + cw + out_txt + reas <= 0:
+                        continue
+                    init = str(data.get("initiator") or "")
+                    mult = (
+                        float(data["cost"])
+                        if (init == "user" and data.get("cost") is not None)
+                        else (1.0 if init == "user" else 0.0)
+                    )
+                    eff = str(data.get("reasoningEffort") or default_effort or "").lower()
+                    sub_k = str(ev.get("agentId") or data.get("parentToolCallId") or "") if init == "sub-agent" else ""
+                    seg["calls"].append([ts or last_ts, raw_m, inp, cr, cw, out_txt, reas, mult, init, eff, sub_k])
+                elif etype == "session.compaction_complete" and data.get("success") is True:
+                    ctu = data.get("compactionTokensUsed")
+                    if isinstance(ctu, dict):
+                        m_cand = str(ctu.get("model") or "").strip()
+                        if m_cand.lower() == "auto":
+                            m_cand = ""
+                        raw_m = m_cand or cur_model or vsc_fallback_model or "(unknown)"
+                        cr = max(0, int(ctu.get("cacheReadTokens") or 0))
+                        cw = max(0, int(ctu.get("cacheWriteTokens") or 0))
+                        raw_in = max(0, int(ctu.get("inputTokens") or 0))
+                        inp = max(0, raw_in - cr - cw)
+                        raw_out = max(0, int(ctu.get("outputTokens") or 0))
+                        if inp + cr + cw + raw_out > 0:
+                            seg["calls"].append([ts or last_ts, raw_m, inp, cr, cw, raw_out, 0, 0.0, "compaction", "", ""])
+                elif etype == "session.shutdown":
+                    cur_m_sh = str(data.get("currentModel") or "").strip()
+                    if cur_m_sh and cur_m_sh.lower() != "auto":
+                        cur_model = cur_m_sh
+                    mm = data.get("modelMetrics")
+                    if isinstance(mm, dict):
+                        snap: dict[str, list[float]] = {}
+                        for m_key, m_obj in mm.items():
+                            if not isinstance(m_obj, dict):
+                                continue
+                            reqs = m_obj.get("requests") if isinstance(m_obj.get("requests"), dict) else {}
+                            usg = m_obj.get("usage") if isinstance(m_obj.get("usage"), dict) else {}
+                            r_cnt = max(1, int(reqs.get("count") or 0))
+                            r_cost = float(reqs.get("cost") or 0.0)
+                            cr = max(0, int(usg.get("cacheReadTokens") or 0))
+                            cw = max(0, int(usg.get("cacheWriteTokens") or 0))
+                            raw_in = max(0, int(usg.get("inputTokens") or 0))
+                            inp = max(0, raw_in - cr - cw)
+                            reas = max(0, int(usg.get("reasoningTokens") or 0))
+                            raw_out = max(0, int(usg.get("outputTokens") or 0))
+                            out_txt = max(0, raw_out - reas)
+                            if inp + cr + cw + out_txt + reas > 0:
+                                snap[str(m_key)] = [r_cnt, r_cost, inp, cr, cw, out_txt, reas]
+                        if snap:
+                            seg["shutdown_metrics"] = snap
+                            seg["shutdown_ts"] = ts or last_ts
+    except OSError:
+        pass
+
+    # Reconcile each process segment (`session.start` / `session.resume` .. `session.shutdown`)
+    calls: list[list[Any]] = []
+    total_shutdown_metrics: dict[str, list[float]] = {}
+    last_shutdown_ts = ""
+    prev_cost_by_model: dict[str, float] = {}
+
+    for seg in segments:
+        seg_calls: list[list[Any]] = list(seg["calls"])
+        seg_msgs: list[list[Any]] = seg["msgs"]
+        sh_map: dict[str, list[float]] = seg["shutdown_metrics"]
+        sh_ts = str(seg["shutdown_ts"] or last_ts)
+        if sh_map:
+            last_shutdown_ts = sh_ts
+
+        # Compute incremental premium-request cost per model across resumed segments
+        seg_eff_cost: dict[str, float] = {}
+        for rm, vals in sh_map.items():
+            r_cnt, r_cost, m_inp, m_cr, m_cw, m_out, m_reas = vals
+            prev_c = prev_cost_by_model.get(rm)
+            if prev_c is None:
+                eff_c = r_cost
+            elif r_cost >= prev_c:
+                eff_c = max(0.0, r_cost - prev_c)
+            else:
+                eff_c = r_cost
+            prev_cost_by_model[rm] = r_cost
+            seg_eff_cost[rm] = eff_c
+
+            tot_m = total_shutdown_metrics.setdefault(rm, [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+            tot_m[0] += r_cnt
+            tot_m[1] += eff_c
+            tot_m[2] += m_inp
+            tot_m[3] += m_cr
+            tot_m[4] += m_cw
+            tot_m[5] += m_out
+            tot_m[6] += m_reas
+
+        if seg_calls:
+            if sh_map:
+                rec_by_m: dict[str, list[float]] = defaultdict(lambda: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+                for c in seg_calls:
+                    rm_c = str(c[1])
+                    rm_acc = rec_by_m[rm_c]
+                    rm_acc[0] += float(c[7] or 0.0)
+                    rm_acc[1] += c[2]
+                    rm_acc[2] += c[3]
+                    rm_acc[3] += c[4]
+                    rm_acc[4] += c[5]
+                    rm_acc[5] += c[6]
+                for rm, vals in sh_map.items():
+                    _rc, _rcost, m_inp, m_cr, m_cw, m_out, m_reas = vals
+                    got = rec_by_m.get(rm) or [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+                    d_inp = max(0, int(m_inp - got[1]))
+                    d_cr = max(0, int(m_cr - got[2]))
+                    d_cw = max(0, int(m_cw - got[3]))
+                    d_out = max(0, int(m_out - got[4]))
+                    d_reas = max(0, int(m_reas - got[5]))
+                    d_mult = max(0.0, seg_eff_cost.get(rm, 0.0) - got[0])
+                    if d_inp + d_cr + d_cw + d_out + d_reas > 0:
+                        seg_calls.append([sh_ts, rm, d_inp, d_cr, d_cw, d_out, d_reas, d_mult, "user", default_effort, ""])
+            calls.extend(seg_calls)
+        elif sh_map:
+            single_model = len(sh_map) == 1
+            for rm, vals in sh_map.items():
+                _rc, _rcost, m_inp, m_cr, m_cw, m_out, m_reas = vals
+                eff_c = seg_eff_cost.get(rm, 0.0)
+                matched = [
+                    m for m in seg_msgs if m[1] == rm or (single_model and (not m[1] or m[1] == vsc_fallback_model))
+                ]
+                if matched:
+                    n_m = len(matched)
+                    ctx_weights = [n_m + idx for idx in range(n_m)]
+                    out_weights = [max(1, int(m[2] or 0)) for m in matched]
+                    alloc_inp = _distribute_int(int(m_inp), ctx_weights)
+                    alloc_cr = _distribute_int(int(m_cr), ctx_weights)
+                    alloc_cw = _distribute_int(int(m_cw), ctx_weights)
+                    alloc_out = _distribute_int(int(m_out), out_weights)
+                    alloc_reas = _distribute_int(int(m_reas), out_weights)
+                    for idx, m_ev in enumerate(matched):
+                        m_ts, _mm, _ow, m_eff, m_sub = m_ev
+                        if alloc_inp[idx] + alloc_cr[idx] + alloc_cw[idx] + alloc_out[idx] + alloc_reas[idx] > 0:
+                            calls.append(
+                                [
+                                    m_ts or sh_ts,
+                                    rm,
+                                    alloc_inp[idx],
+                                    alloc_cr[idx],
+                                    alloc_cw[idx],
+                                    alloc_out[idx],
+                                    alloc_reas[idx],
+                                    eff_c if idx == 0 else 0.0,
+                                    "user" if idx == 0 else "agent",
+                                    m_eff or default_effort,
+                                    m_sub,
+                                ]
+                            )
+                else:
+                    calls.append(
+                        [
+                            sh_ts,
+                            rm,
+                            int(m_inp),
+                            int(m_cr),
+                            int(m_cw),
+                            int(m_out),
+                            int(m_reas),
+                            eff_c,
+                            "user",
+                            default_effort,
+                            "",
+                        ]
+                    )
+
+    return {
+        "sid": sid,
+        "parent_sid": parent_sid,
+        "cwd": cwd,
+        "title": title or prompt_fallback,
+        "start_time": start_time,
+        "last_ts": last_ts,
+        "default_model": cur_model,
+        "default_effort": default_effort,
+        "calls": calls,
+        "shutdown_metrics": total_shutdown_metrics,
+        "shutdown_ts": last_shutdown_ts,
+        "segments_reconciled": True,
+    }
+
+
+def _parse_copilot_store_db(db_path: str) -> dict[str, Any]:
+    """
+    Read ~/.copilot/state/session-store.db (read-only), extracting `sessions`, first prompt
+    from `turns`, and per-call usage rows from `assistant_usage_events`.
+    """
+    sessions_meta: dict[str, dict[str, str]] = {}
+    calls_by_sid: dict[str, list[list[Any]]] = defaultdict(list)
+    try:
+        con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=2.0)
+    except sqlite3.Error:
+        return {"sessions": {}, "calls": {}}
+
+    try:
+        tables = {
+            r[0]
+            for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+        }
+        if "sessions" in tables:
+            s_cols = {r[1] for r in con.execute("PRAGMA table_info(sessions)").fetchall()}
+            sel_cols = [
+                c
+                for c in ("id", "cwd", "repository", "summary", "agent_name", "created_at", "updated_at")
+                if c in s_cols
+            ]
+            if "id" in sel_cols:
+                for row in con.execute(f"SELECT {', '.join(sel_cols)} FROM sessions"):
+                    rec = dict(zip(sel_cols, row))
+                    sid = str(rec.get("id") or "")
+                    if sid:
+                        sessions_meta[sid] = {
+                            "cwd": str(rec.get("cwd") or ""),
+                            "repository": str(rec.get("repository") or ""),
+                            "summary": str(rec.get("summary") or ""),
+                            "agent_name": str(rec.get("agent_name") or ""),
+                            "created_at": str(rec.get("created_at") or ""),
+                            "updated_at": str(rec.get("updated_at") or ""),
+                        }
+
+        if "turns" in tables:
+            t_cols = {r[1] for r in con.execute("PRAGMA table_info(turns)").fetchall()}
+            if {"session_id", "user_message"}.issubset(t_cols):
+                order_clause = "ORDER BY session_id, turn_index ASC" if "turn_index" in t_cols else ""
+                seen_turn_sid: set[str] = set()
+                for sid_raw, u_msg in con.execute(
+                    f"SELECT session_id, user_message FROM turns WHERE user_message IS NOT NULL AND user_message != '' {order_clause}"
+                ):
+                    sid = str(sid_raw or "")
+                    if sid and sid not in seen_turn_sid:
+                        seen_turn_sid.add(sid)
+                        m_entry = sessions_meta.setdefault(sid, {})
+                        if not m_entry.get("summary"):
+                            m_entry["prompt"] = str(u_msg).strip()[:120]
+
+        if "assistant_usage_events" in tables:
+            u_cols = {r[1] for r in con.execute("PRAGMA table_info(assistant_usage_events)").fetchall()}
+            wanted = [
+                "session_id",
+                "agent_id",
+                "parent_tool_call_id",
+                "model",
+                "input_tokens",
+                "output_tokens",
+                "cache_read_tokens",
+                "cache_write_tokens",
+                "reasoning_tokens",
+                "request_multiplier",
+                "initiator",
+                "reasoning_effort",
+                "created_at",
+            ]
+            exprs = [c if c in u_cols else f"NULL AS {c}" for c in wanted]
+            order_by = "ORDER BY id ASC" if "id" in u_cols else ""
+            for row in con.execute(f"SELECT {', '.join(exprs)} FROM assistant_usage_events {order_by}"):
+                (
+                    sid_raw,
+                    agent_id,
+                    parent_tc,
+                    raw_m,
+                    in_tok,
+                    out_tok,
+                    cr_tok,
+                    cw_tok,
+                    reas_tok,
+                    req_mult,
+                    initiator,
+                    reas_eff,
+                    created_at,
+                ) = row
+                sid = str(sid_raw or "")
+                if not sid:
+                    continue
+                cr = max(0, int(cr_tok or 0))
+                cw = max(0, int(cw_tok or 0))
+                raw_in = max(0, int(in_tok or 0))
+                inp = max(0, raw_in - cr - cw)
+                reas = max(0, int(reas_tok or 0))
+                raw_out = max(0, int(out_tok or 0))
+                out_txt = max(0, raw_out - reas)
+                if inp + cr + cw + out_txt + reas <= 0:
+                    continue
+                init = str(initiator or "")
+                mult = (
+                    float(req_mult)
+                    if (init == "user" and req_mult is not None)
+                    else (1.0 if init == "user" else 0.0)
+                )
+                eff = str(reas_eff or "").lower()
+                sub_k = ""
+                if init == "sub-agent" or parent_tc:
+                    sub_k = str(agent_id or parent_tc or "subagent")
+                calls_by_sid[sid].append(
+                    [
+                        str(created_at or ""),
+                        str(raw_m or "(unknown)"),
+                        inp,
+                        cr,
+                        cw,
+                        out_txt,
+                        reas,
+                        mult,
+                        init,
+                        eff,
+                        sub_k,
+                    ]
+                )
+    except sqlite3.Error:
+        pass
+    finally:
+        con.close()
+
+    return {"sessions": sessions_meta, "calls": dict(calls_by_sid)}
+
+
+def _apply_vscode_jsonl_mutation(root: Any, entry: dict[str, Any]) -> Any:
+    """Replay one entry of VS Code's ObjectMutationLog (`kind`: 0=init, 1=set, 2=push, 3=delete)."""
+    kind = entry.get("kind")
+    if kind == 0:
+        return entry.get("v")
+    if root is None or not isinstance(entry.get("k"), list):
+        return root
+    path = entry["k"]
+    if not path:
+        return root
+    cur = root
+    try:
+        for seg in path[:-1]:
+            if isinstance(cur, list) and isinstance(seg, int):
+                cur = cur[seg]
+            elif isinstance(cur, dict):
+                cur = cur[str(seg)]
+            else:
+                return root
+        last = path[-1]
+        if kind == 1:
+            if isinstance(cur, list) and isinstance(last, int):
+                if 0 <= last < len(cur):
+                    cur[last] = entry.get("v")
+                elif last == len(cur):
+                    cur.append(entry.get("v"))
+            elif isinstance(cur, dict):
+                cur[str(last)] = entry.get("v")
+        elif kind == 2:
+            arr: Any = None
+            if isinstance(cur, dict):
+                arr = cur.get(str(last))
+                if not isinstance(arr, list):
+                    arr = []
+                    cur[str(last)] = arr
+            elif isinstance(cur, list) and isinstance(last, int) and 0 <= last < len(cur):
+                arr = cur[last]
+                if not isinstance(arr, list):
+                    arr = []
+                    cur[last] = arr
+            if isinstance(arr, list):
+                trunc_i = entry.get("i")
+                if isinstance(trunc_i, int) and trunc_i >= 0:
+                    del arr[trunc_i:]
+                vals = entry.get("v")
+                if isinstance(vals, list) and vals:
+                    arr.extend(vals)
+        elif kind == 3:
+            if isinstance(cur, dict):
+                cur.pop(str(last), None)
+            elif isinstance(cur, list) and isinstance(last, int) and 0 <= last < len(cur):
+                cur[last] = None
+    except (IndexError, KeyError, TypeError):
+        pass
+    return root
+
+
+def _first_int(*vals: Any) -> int | None:
+    for v in vals:
+        if isinstance(v, (int, float)) and not isinstance(v, bool):
+            return int(v)
+    return None
+
+
+def _extract_vscode_uri_str(val: Any) -> str:
+    if isinstance(val, str):
+        return val
+    if isinstance(val, dict):
+        if val.get("fsPath"):
+            return str(val["fsPath"])
+        if val.get("path"):
+            return str(val["path"])
+        if val.get("external"):
+            return str(val["external"])
+    return ""
+
+
+_VSC_DETAIL_MULT_RE = re.compile(r"•\s*([0-9]+(?:\.[0-9]+)?)\s*(?:x|credits?)\b", re.IGNORECASE)
+
+
+def _pick_vscode_model(*cands: Any) -> str:
+    for c in cands:
+        if not isinstance(c, str):
+            continue
+        s = c.strip()
+        if s and s.lower() not in ("auto", "copilot/auto", "github-copilot/auto"):
+            return s
+    return "copilot-chat"
+
+
+def _parse_vscode_copilot_session(args: tuple[str, str]) -> dict[str, Any]:
+    """
+    Worker: parse a VS Code / Insiders / VSCodium `chatSessions/*.{jsonl,json}` file.
+    Replays `ObjectMutationLog` deltas for `.jsonl` files and extracts GitHub Copilot turns,
+    reconstructing full multi-round `toolCallRounds` context trajectories across both older
+    (`github.copilot-chat` v0.33+) and newer integrated VS Code chat schemas.
+    """
+    path_str, ws_uri = args
+    p = Path(path_str)
+    session: Any = None
+    try:
+        if path_str.endswith(".jsonl"):
+            with open(path_str, "r", encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    s = line.strip()
+                    if not s:
+                        continue
+                    try:
+                        entry = json.loads(s)
+                    except ValueError:
+                        continue
+                    if isinstance(entry, dict):
+                        session = _apply_vscode_jsonl_mutation(session, entry)
+        else:
+            session = json.loads(p.read_text(encoding="utf-8", errors="replace"))
+    except (OSError, ValueError):
+        session = None
+
+    if not isinstance(session, dict):
+        return {"sid": p.stem, "cwd": ws_uri, "title": "", "creation_ms": 0, "calls": []}
+
+    responder = str(session.get("responderUsername") or "").strip()
+    resp_low = responder.lower()
+    if resp_low and ("codex" in resp_low or "claude code" in resp_low):
+        return {"sid": p.stem, "cwd": ws_uri, "title": "", "creation_ms": 0, "calls": []}
+
+    sid = str(session.get("sessionId") or p.stem)
+    creation_ms = to_epoch_ms(session.get("creationDate"))
+    cwd = (
+        ws_uri
+        or _extract_vscode_uri_str(session.get("workingDirectory"))
+        or _extract_vscode_uri_str(
+            (session.get("repoData") or {}).get("rootUri") if isinstance(session.get("repoData"), dict) else ""
+        )
+    )
+    title = str(session.get("customTitle") or session.get("computedTitle") or "").strip()
+    prompt_fallback = ""
+
+    inp_state = session.get("inputState") if isinstance(session.get("inputState"), dict) else {}
+    sel_model_obj = inp_state.get("selectedModel") if isinstance(inp_state.get("selectedModel"), dict) else {}
+    session_default_model = str(sel_model_obj.get("identifier") or "")
+
+    calls: list[list[Any]] = []
+    prev_req_prompt = 0
+    requests = session.get("requests")
+    if isinstance(requests, list):
+        for req in requests:
+            if not isinstance(req, dict):
+                continue
+            agent = req.get("agent") if isinstance(req.get("agent"), dict) else {}
+            agent_id = str(agent.get("id") or "")
+            if agent_id == "setup.agent":
+                continue
+            ext_val = agent.get("extensionId")
+            ext_id = (
+                str(ext_val.get("value") if isinstance(ext_val, dict) else (ext_val or "")).strip().lower()
+            )
+            if ext_id and not any(k in ext_id for k in ("copilot", "github", "vscode.chat")):
+                continue
+
+            if not prompt_fallback:
+                msg = req.get("message")
+                if isinstance(msg, dict) and isinstance(msg.get("text"), str) and msg["text"].strip():
+                    prompt_fallback = msg["text"].strip()[:120]
+                elif isinstance(msg, str) and msg.strip():
+                    prompt_fallback = msg.strip()[:120]
+
+            ts_ms = to_epoch_ms(req.get("responseTimestamp") or req.get("timestamp")) or creation_ms
+            lmc = req.get("latestModelCall") if isinstance(req.get("latestModelCall"), dict) else {}
+            auto_res = lmc.get("autoModeResolved") if isinstance(lmc.get("autoModeResolved"), dict) else {}
+            mode_info = req.get("modeInfo") if isinstance(req.get("modeInfo"), dict) else {}
+            m_cfg = req.get("modelConfiguration") if isinstance(req.get("modelConfiguration"), dict) else {}
+            eff = str(
+                auto_res.get("reasoningBucket")
+                or mode_info.get("reasoningEffort")
+                or m_cfg.get("reasoningEffort")
+                or ""
+            ).lower()
+
+            res_obj = req.get("result") if isinstance(req.get("result"), dict) else {}
+            meta_obj = res_obj.get("metadata") if isinstance(res_obj.get("metadata"), dict) else {}
+            det_str = str(res_obj.get("details") or "").strip()
+            det_model = det_str.split("•", 1)[0].strip() if "•" in det_str else ""
+
+            mult_val = req.get("copilotCredits")
+            if mult_val is None:
+                mult_val = lmc.get("cost")
+            if isinstance(mult_val, (int, float)) and not isinstance(mult_val, bool):
+                mult = float(mult_val)
+            else:
+                m_det = _VSC_DETAIL_MULT_RE.search(det_str)
+                mult = float(m_det.group(1)) if m_det else 0.0
+
+            fallback_model = _pick_vscode_model(
+                auto_res.get("chosenModel"),
+                meta_obj.get("resolvedModel"),
+                meta_obj.get("modelId"),
+                meta_obj.get("model"),
+                res_obj.get("modelId"),
+                req.get("modelId"),
+                det_model,
+                session_default_model,
+            )
+
+            # 1) Prefer explicit per-model breakdown (`turnTokenTotals` / `modelTotals`) when available
+            per_model_list = lmc.get("turnTokenTotals") or req.get("modelTotals")
+            emitted_multi = False
+            if isinstance(per_model_list, list) and per_model_list:
+                for idx_m, item in enumerate(per_model_list):
+                    if not isinstance(item, dict):
+                        continue
+                    m_name = _pick_vscode_model(item.get("model"), fallback_model)
+                    cr = max(0, int(item.get("cachedTokens") or item.get("cacheReadTokens") or 0))
+                    cw = max(0, int(item.get("cacheCreationTokens") or item.get("cacheWriteTokens") or 0))
+                    r_in = max(0, int(item.get("inputTokens") or item.get("promptTokens") or 0))
+                    inp = max(0, r_in - cr - cw)
+                    reas = max(0, int(item.get("reasoningTokens") or 0))
+                    r_out = max(0, int(item.get("outputTokens") or item.get("completionTokens") or 0))
+                    out_txt = max(0, r_out - reas)
+                    if inp + cr + cw + out_txt + reas > 0:
+                        calls.append(
+                            [ts_ms, m_name, inp, cr, cw, out_txt, reas, mult if idx_m == 0 else 0.0, "user", eff, ""]
+                        )
+                        emitted_multi = True
+            if emitted_multi:
+                continue
+
+            u_obj = req.get("usage") if isinstance(req.get("usage"), dict) else {}
+            res_u = (
+                res_obj.get("usage")
+                if isinstance(res_obj.get("usage"), dict)
+                else (meta_obj.get("usage") if isinstance(meta_obj.get("usage"), dict) else {})
+            )
+            ptd_candidates = (
+                req.get("promptTokenDetails"),
+                u_obj.get("promptTokenDetails"),
+                res_u.get("prompt_tokens_details"),
+                meta_obj.get("promptTokenDetails"),
+            )
+            ptd = next((d for d in ptd_candidates if isinstance(d, dict)), {})
+            explicit_cr = max(
+                0,
+                _first_int(
+                    ptd.get("cached_tokens"),
+                    ptd.get("cachedTokens"),
+                    u_obj.get("cachedTokens"),
+                    u_obj.get("cacheReadTokens"),
+                    res_u.get("cache_read_input_tokens"),
+                    meta_obj.get("cachedTokens"),
+                )
+                or 0,
+            )
+
+            # 2) Multi-round agentic / chat turns (`result.metadata.toolCallRounds`)
+            tcr_raw = meta_obj.get("toolCallRounds")
+            tcr_dicts = [rd for rd in tcr_raw if isinstance(rd, dict)] if isinstance(tcr_raw, list) else []
+            if tcr_dicts:
+                n_rounds = len(tcr_dicts)
+                timings = res_obj.get("timings") if isinstance(res_obj.get("timings"), dict) else {}
+                elapsed_ms = max(0, int(timings.get("totalElapsed") or req.get("elapsedMs") or 0))
+                tcr_results = (
+                    meta_obj.get("toolCallResults") if isinstance(meta_obj.get("toolCallResults"), dict) else {}
+                )
+
+                rounds_meta: list[tuple[int, int, int, int]] = []  # (ts_ms, out_chars, reas_chars, tool_res_chars)
+                for idx_r, rd in enumerate(tcr_dicts):
+                    rd_ts = to_epoch_ms(rd.get("timestamp"))
+                    if not rd_ts:
+                        rd_ts = ts_ms + ((elapsed_ms * idx_r) // max(1, n_rounds))
+                    resp_s = str(rd.get("response") or "")
+                    tcs_val = rd.get("toolCalls")
+                    if isinstance(tcs_val, str):
+                        try:
+                            tcs_val = json.loads(tcs_val)
+                        except ValueError:
+                            tcs_val = []
+                    tcs_list = tcs_val if isinstance(tcs_val, list) else []
+                    tc_json = json.dumps(tcs_list, separators=(",", ":")) if tcs_list else ""
+                    th_val = rd.get("thinking")
+                    if isinstance(th_val, dict):
+                        think_s = str(th_val.get("text") or "")
+                    elif isinstance(th_val, str):
+                        think_s = th_val
+                    else:
+                        think_s = ""
+                    out_c = len(resp_s) + len(tc_json)
+                    reas_c = len(think_s)
+                    res_c = 0
+                    for tc in tcs_list:
+                        if isinstance(tc, dict):
+                            tc_id = tc.get("id")
+                            if tc_id and tc_id in tcr_results:
+                                res_c += len(json.dumps(tcr_results[tc_id], separators=(",", ":")))
+                    rounds_meta.append((rd_ts, out_c, reas_c, res_c))
+
+                final_prompt_opt = _first_int(
+                    req.get("promptTokens"),
+                    u_obj.get("promptTokens"),
+                    u_obj.get("prompt_tokens"),
+                    u_obj.get("inputTokens"),
+                    res_u.get("prompt_tokens"),
+                    res_u.get("promptTokens"),
+                    res_u.get("input_tokens"),
+                    meta_obj.get("promptTokens"),
+                    meta_obj.get("inputTokens"),
+                )
+                step_adds = [
+                    max(1, (rounds_meta[k][1] + rounds_meta[k][2] + rounds_meta[k][3]) // 4)
+                    for k in range(n_rounds)
+                ]
+                prompt_at = [0] * n_rounds
+                if final_prompt_opt is not None and final_prompt_opt > 0:
+                    prompt_at[n_rounds - 1] = final_prompt_opt
+                    for k in range(n_rounds - 2, -1, -1):
+                        prompt_at[k] = max(256, prompt_at[k + 1] - step_adds[k])
+                else:
+                    rum = meta_obj.get("renderedUserMessage")
+                    rgc = meta_obj.get("renderedGlobalContext")
+                    if rum or rgc:
+                        init_c = (len(json.dumps(rum, separators=(",", ":"))) if rum else 0) + (
+                            len(json.dumps(rgc, separators=(",", ":"))) if rgc else 0
+                        )
+                    else:
+                        msg_o = req.get("message")
+                        vd_o = req.get("variableData")
+                        init_c = (len(json.dumps(msg_o, separators=(",", ":"))) if msg_o else 0) + (
+                            len(json.dumps(vd_o, separators=(",", ":"))) if vd_o else 0
+                        )
+                    prompt_at[0] = prev_req_prompt + max(64, init_c // 4)
+                    for k in range(1, n_rounds):
+                        prompt_at[k] = prompt_at[k - 1] + step_adds[k - 1]
+
+                total_comp_opt = _first_int(
+                    req.get("completionTokens"),
+                    u_obj.get("completionTokens"),
+                    u_obj.get("completion_tokens"),
+                    u_obj.get("outputTokens"),
+                    res_u.get("completion_tokens"),
+                    res_u.get("completionTokens"),
+                    res_u.get("output_tokens"),
+                )
+                last_out_opt = _first_int(meta_obj.get("outputTokens"), meta_obj.get("completionTokens"))
+
+                round_outs: list[tuple[int, int]] = []
+                if total_comp_opt is not None and total_comp_opt > 0:
+                    w_out = [max(1, rounds_meta[k][1] + rounds_meta[k][2]) for k in range(n_rounds)]
+                    alloc_tot = _distribute_int(total_comp_opt, w_out)
+                    for k in range(n_rounds):
+                        tk = alloc_tot[k]
+                        oc, rc = rounds_meta[k][1], rounds_meta[k][2]
+                        rk = (tk * rc) // max(1, oc + rc) if rc > 0 else 0
+                        round_outs.append((max(0, tk - rk), rk))
+                else:
+                    for k in range(n_rounds):
+                        round_outs.append((rounds_meta[k][1] // 4, rounds_meta[k][2] // 4))
+                    if last_out_opt is not None and last_out_opt > 0:
+                        rc_last = round_outs[n_rounds - 1][1]
+                        out_last = max(0, last_out_opt - rc_last) if last_out_opt >= rc_last else last_out_opt
+                        round_outs[n_rounds - 1] = (out_last, rc_last)
+
+                for k in range(n_rounds):
+                    rd_ts = rounds_meta[k][0]
+                    if k == 0:
+                        cr_k = min(prev_req_prompt, max(0, prompt_at[0] - 1))
+                        if n_rounds == 1 and explicit_cr > cr_k:
+                            cr_k = min(prompt_at[0], explicit_cr)
+                    else:
+                        cr_k = min(prompt_at[k - 1], prompt_at[k])
+                    inp_k = max(0, prompt_at[k] - cr_k)
+                    out_k, reas_k = round_outs[k]
+                    if inp_k + cr_k + out_k + reas_k > 0:
+                        r_eff = eff or ("thinking" if reas_k > 0 else "")
+                        calls.append(
+                            [
+                                rd_ts,
+                                fallback_model,
+                                inp_k,
+                                cr_k,
+                                0,
+                                out_k,
+                                reas_k,
+                                mult if k == 0 else 0.0,
+                                "user" if k == 0 else "agent",
+                                r_eff,
+                                "",
+                            ]
+                        )
+
+                prev_req_prompt = prompt_at[n_rounds - 1] + step_adds[n_rounds - 1]
+
+                # Emit any `subAgentInvocationId` subagent tool streams embedded in `req.response`
+                resp_arr = req.get("response")
+                if isinstance(resp_arr, list):
+                    sub_chars_by_id: dict[str, int] = defaultdict(int)
+                    for item in resp_arr:
+                        if isinstance(item, dict) and item.get("subAgentInvocationId"):
+                            sub_id = str(item["subAgentInvocationId"])
+                            sub_chars_by_id[sub_id] += len(json.dumps(item, separators=(",", ":")))
+                    for sub_id, sc in sub_chars_by_id.items():
+                        if sc > 0:
+                            s_tok = max(1, sc // 4)
+                            calls.append(
+                                [
+                                    rounds_meta[0][0],
+                                    fallback_model,
+                                    max(1, s_tok // 2),
+                                    s_tok,
+                                    0,
+                                    max(1, s_tok // 4),
+                                    0,
+                                    0.0,
+                                    "sub-agent",
+                                    eff,
+                                    sub_id[:28],
+                                ]
+                            )
+                continue
+
+            # 3) Standard single-turn usage (`req.promptTokens`/`completionTokens`, `usage`, `result.metadata`)
+            raw_in_opt = _first_int(
+                req.get("promptTokens"),
+                u_obj.get("promptTokens"),
+                u_obj.get("prompt_tokens"),
+                u_obj.get("inputTokens"),
+                res_u.get("prompt_tokens"),
+                res_u.get("promptTokens"),
+                res_u.get("input_tokens"),
+                meta_obj.get("promptTokens"),
+                meta_obj.get("inputTokens"),
+            )
+            raw_out_opt = _first_int(
+                req.get("completionTokens"),
+                u_obj.get("completionTokens"),
+                u_obj.get("completion_tokens"),
+                u_obj.get("outputTokens"),
+                res_u.get("completion_tokens"),
+                res_u.get("completionTokens"),
+                res_u.get("output_tokens"),
+                meta_obj.get("outputTokens"),
+                meta_obj.get("completionTokens"),
+            )
+            if raw_in_opt is None and raw_out_opt is None:
+                resp_arr = req.get("response")
+                resp_c = len(json.dumps(resp_arr, separators=(",", ":"))) if resp_arr else 0
+                msg_c = len(json.dumps(req.get("message") or "", separators=(",", ":")))
+                if resp_c > 32 and not req.get("isCanceled"):
+                    inp_fb = max(1, msg_c // 4)
+                    cr_fb = prev_req_prompt
+                    out_fb = max(1, resp_c // 4)
+                    prev_req_prompt += inp_fb + out_fb
+                    calls.append([ts_ms, fallback_model, inp_fb, cr_fb, 0, out_fb, 0, mult, "user", eff, ""])
+                continue
+
+            ctd = (
+                res_u.get("completion_tokens_details")
+                if isinstance(res_u.get("completion_tokens_details"), dict)
+                else (
+                    u_obj.get("completion_tokens_details")
+                    if isinstance(u_obj.get("completion_tokens_details"), dict)
+                    else {}
+                )
+            )
+            cw = max(
+                0,
+                _first_int(
+                    ptd.get("cache_creation_input_tokens"),
+                    ptd.get("cache_creation_tokens"),
+                    ptd.get("cacheCreationTokens"),
+                    u_obj.get("cacheCreationTokens"),
+                    u_obj.get("cacheWriteTokens"),
+                    res_u.get("cache_creation_input_tokens"),
+                )
+                or 0,
+            )
+            raw_in = max(0, raw_in_opt or 0)
+            cr = explicit_cr if explicit_cr > 0 else min(prev_req_prompt, max(0, raw_in - cw - 1))
+            inp = max(0, raw_in - cr - cw)
+            reas = max(
+                0,
+                _first_int(
+                    ctd.get("reasoning_tokens"),
+                    ctd.get("reasoningTokens"),
+                    res_u.get("reasoning_tokens"),
+                    u_obj.get("reasoningTokens"),
+                )
+                or 0,
+            )
+            raw_out = max(0, raw_out_opt or 0)
+            out_txt = max(0, raw_out - reas)
+            if inp + cr + cw + out_txt + reas > 0:
+                prev_req_prompt = raw_in + raw_out
+                calls.append([ts_ms, fallback_model, inp, cr, cw, out_txt, reas, mult, "user", eff, ""])
+
+    return {
+        "sid": sid,
+        "cwd": cwd,
+        "title": title or prompt_fallback,
+        "creation_ms": creation_ms,
+        "calls": calls,
+    }
+
+
+_JB_FILE_PATH_RE = re.compile(r'filePath="(/[^"]+)"')
+_JB_UNIX_PATH_RE = re.compile(r"(/(?:home|Users)/[^\s\"'<>`;&|)]+)")
+
+
+def _clean_jb_workspace_path(cand: str) -> str:
+    """Clean a source path extracted from JetBrains Copilot prompts/tools into a repo/workspace root."""
+    p = cand.strip().rstrip("\"'<>.,;:)`")
+    if not p or not p.startswith("/"):
+        return ""
+    parts = p.split("/")
+    # Collapse `/home/<user>/<src_dir>/<repo>/...` directly to `/home/<user>/<src_dir>/<repo>`
+    if len(parts) >= 5 and parts[1] in ("home", "Users") and parts[3] in ("src", "code", "projects", "repos"):
+        return "/".join(parts[:5])
+    base = os.path.basename(p)
+    if "." in base and not base.startswith("."):
+        return os.path.dirname(p)
+    return p
+
+
+def _jb_dir_sig(conv_dir: Path) -> tuple[int, int] | None:
+    """Combined `(max_mtime_ns, total_bytes)` signature across `partition-*.jsonl` in a JB conversation dir."""
+    max_mtime = 0
+    tot_size = 0
+    found = False
+    try:
+        for entry in conv_dir.iterdir():
+            if entry.is_file() and entry.name.startswith("partition-") and entry.name.endswith(".jsonl"):
+                st = entry.stat()
+                max_mtime = max(max_mtime, st.st_mtime_ns)
+                tot_size += st.st_size
+                found = True
+    except OSError:
+        return None
+    return (max_mtime, tot_size) if found else None
+
+
+def _parse_jetbrains_copilot_conv(conv_dir_str: str) -> dict[str, Any]:
+    """
+    Worker: parse JetBrains GitHub Copilot `<copilot_home>/jb/<cid>/partition-*.jsonl`.
+    JetBrains Copilot logs verbatim `renderedMessage`, `assistant.message` (`text` + `thinking`),
+    and `tool.execution_start` / `tool.execution_complete` without raw token integers; reconstructs
+    per-call cumulative prompt cache (`chars // 4`), uncached delta, output, and reasoning tokens.
+    """
+    cdir = Path(conv_dir_str)
+    cid = cdir.name
+    has_partition_created = False
+    created_ms = 0
+    start_ms = 0
+    end_ms = 0
+    cwd = ""
+    title = ""
+    prompt_fallback = ""
+    saw_anthropic = False
+    calls: list[list[Any]] = []
+    subagent_windows: list[list[Any]] = []
+    active_subagents: dict[str, tuple[int, str]] = {}
+
+    def _part_sort_key(p: Path) -> tuple[int, str]:
+        stem = p.stem
+        if "-" in stem:
+            try:
+                return (int(stem.split("-", 1)[1]), p.name)
+            except ValueError:
+                pass
+        return (999999, p.name)
+
+    try:
+        part_files = sorted(
+            [
+                e
+                for e in cdir.iterdir()
+                if e.is_file() and e.name.startswith("partition-") and e.name.endswith(".jsonl")
+            ],
+            key=_part_sort_key,
+        )
+    except OSError:
+        part_files = []
+
+    history_chars = 0
+    pending_fresh_chars = 0
+
+    for pf in part_files:
+        try:
+            with open(pf, "r", encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    s = line.strip()
+                    if not s:
+                        continue
+                    try:
+                        ev = json.loads(s)
+                    except ValueError:
+                        continue
+                    if not isinstance(ev, dict):
+                        continue
+                    etype = ev.get("type") or ""
+                    ts_ms = to_epoch_ms(ev.get("timestamp"))
+                    if ts_ms:
+                        start_ms = min(start_ms, ts_ms) if start_ms else ts_ms
+                        end_ms = max(end_ms, ts_ms)
+                    data = ev.get("data")
+                    if not isinstance(data, dict):
+                        data = {}
+
+                    if etype == "partition.created":
+                        has_partition_created = True
+                        if data.get("conversationId"):
+                            cid = str(data["conversationId"])
+                        c_at = to_epoch_ms(data.get("createdAt")) or ts_ms
+                        if c_at and not created_ms:
+                            created_ms = c_at
+                    elif etype == "user.message":
+                        c_val = data.get("content") or ""
+                        if isinstance(c_val, str) and c_val.strip() and not title:
+                            title = c_val.strip()[:120]
+                    elif etype == "user.message_rendered":
+                        rm_str = str(data.get("renderedMessage") or "")
+                        pending_fresh_chars += len(rm_str)
+                        if not prompt_fallback and "<userRequest>" in rm_str and "</userRequest>" in rm_str:
+                            ur = rm_str.split("<userRequest>", 1)[1].split("</userRequest>", 1)[0].strip()
+                            if ur:
+                                prompt_fallback = ur[:120]
+                        if not cwd and rm_str:
+                            m_fp = _JB_FILE_PATH_RE.search(rm_str) or _JB_UNIX_PATH_RE.search(rm_str)
+                            if m_fp:
+                                cwd = _clean_jb_workspace_path(m_fp.group(1))
+                    elif etype == "assistant.message":
+                        text_s = str(data.get("text") or data.get("content") or "")
+                        thinking_obj = data.get("thinking")
+                        think_s = ""
+                        if isinstance(thinking_obj, dict):
+                            saw_anthropic = True
+                            think_s = str(thinking_obj.get("text") or "")
+                        elif isinstance(thinking_obj, str):
+                            think_s = thinking_obj
+                        explicit_m = str(data.get("model") or "").strip()
+                        raw_m = explicit_m or ("claude-sonnet-4-6" if saw_anthropic else "copilot-jetbrains")
+                        cr = history_chars // 4
+                        inp = max(1, pending_fresh_chars // 4)
+                        out_txt = len(text_s) // 4
+                        reas = len(think_s) // 4
+                        iter_n = int(data.get("iterationNumber") or 0)
+                        eff = "thinking" if think_s else ""
+                        eff_ts = ts_ms or end_ms or created_ms
+                        calls.append(
+                            [
+                                eff_ts,
+                                raw_m,
+                                inp,
+                                cr,
+                                0,
+                                out_txt,
+                                reas,
+                                1.0 if iter_n == 1 else 0.0,
+                                "user" if iter_n == 1 else "agent",
+                                eff,
+                                "",
+                            ]
+                        )
+                        history_chars += pending_fresh_chars + len(text_s) + len(think_s)
+                        pending_fresh_chars = 0
+                    elif etype == "tool.execution_start":
+                        tc_id = str(data.get("toolCallId") or "")
+                        if tc_id.startswith("toolu_"):
+                            saw_anthropic = True
+                        t_name = str(data.get("toolName") or "")
+                        args = data.get("arguments")
+                        args_str = json.dumps(args, separators=(",", ":")) if args is not None else ""
+                        if args_str:
+                            if calls:
+                                calls[-1][5] += len(args_str) // 4
+                            history_chars += len(args_str)
+                        if not cwd and isinstance(args, dict):
+                            cand_p = str(args.get("path") or args.get("filePath") or "")
+                            if cand_p.startswith("/"):
+                                cwd = _clean_jb_workspace_path(cand_p)
+                            elif args.get("command"):
+                                m_cmd = _JB_UNIX_PATH_RE.search(str(args["command"]))
+                                if m_cmd:
+                                    cwd = _clean_jb_workspace_path(m_cmd.group(1))
+                        if t_name == "run_subagent" and tc_id:
+                            ag_lbl = str(args.get("agentName") or "subagent") if isinstance(args, dict) else "subagent"
+                            active_subagents[tc_id] = (ts_ms or end_ms, ag_lbl)
+                    elif etype == "tool.execution_complete":
+                        tc_id = str(data.get("toolCallId") or "")
+                        res_obj = data.get("result")
+                        if res_obj is not None:
+                            pending_fresh_chars += len(json.dumps(res_obj, separators=(",", ":")))
+                        if tc_id in active_subagents:
+                            st_ms, ag_lbl = active_subagents.pop(tc_id)
+                            subagent_windows.append([st_ms, ts_ms or end_ms or st_ms, ag_lbl])
+        except OSError:
+            pass
+
+    for _tc_id, (st_ms, ag_lbl) in active_subagents.items():
+        subagent_windows.append([st_ms, end_ms or st_ms, ag_lbl])
+
+    if saw_anthropic:
+        for c in calls:
+            if c[1] == "copilot-jetbrains":
+                c[1] = "claude-sonnet-4-6"
+
+    if not has_partition_created:
+        for c in calls:
+            c[7] = 0.0
+
+    return {
+        "sid": cid,
+        "has_partition_created": has_partition_created,
+        "created_ms": created_ms or start_ms,
+        "start_ms": start_ms,
+        "end_ms": end_ms,
+        "cwd": cwd,
+        "title": title or prompt_fallback,
+        "calls": calls,
+        "subagent_windows": subagent_windows,
+    }
+
+
+_COPILOT_LOG_SKU_RE = re.compile(
+    r"^(\d{4}-\d{2}-\d{2})\s+\S+\s+\[info\]\s+copilot token\b.*?\bsku:\s*([A-Za-z0-9_]+)"
+)
+
+
+def _parse_copilot_chat_log(path_str: str) -> dict[str, Any]:
+    """Worker: extract `(date_iso, sku)` billing-tier samples from `GitHub Copilot Chat.log`."""
+    seen: set[tuple[str, str]] = set()
+    samples: list[list[str]] = []
+    try:
+        with open(path_str, "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                if "sku:" not in line:
+                    continue
+                m = _COPILOT_LOG_SKU_RE.match(line)
+                if m:
+                    pair = (m.group(1), m.group(2))
+                    if pair not in seen:
+                        seen.add(pair)
+                        samples.append([pair[0], pair[1]])
+    except OSError:
+        pass
+    return {"samples": samples}
+
+
+def extract_copilot(cache_con: sqlite3.Connection, pool: ProcessPoolExecutor | None) -> dict[str, Any]:
+    """
+    Extract GitHub Copilot telemetry across:
+      1. GitHub Copilot CLI / VS Code Agent (`$COPILOT_HOME/state/session-store.db` + `session-state/*/events.jsonl`)
+      2. JetBrains GitHub Copilot (`$COPILOT_HOME/jb/*/partition-*.jsonl`)
+      3. VS Code / Code - Insiders / VSCodium Copilot Chat (`chatSessions/*.{jsonl,json}` + `logs/**/GitHub Copilot Chat.log`)
+    """
+    t0 = time.time()
+    env_cop = os.environ.get("COPILOT_HOME")
+    copilot_home = Path(env_cop).expanduser() if env_cop else (HOME / ".copilot")
+
+    copilot_roots: list[Path] = []
+    seen_cop_roots: set[Path] = set()
+    for cand_root in [copilot_home, *[b / ".copilot" for b in get_backup_roots()]]:
+        if not cand_root.is_dir():
+            continue
+        try:
+            rp = cand_root.resolve()
+        except OSError:
+            rp = cand_root
+        if rp not in seen_cop_roots:
+            seen_cop_roots.add(rp)
+            copilot_roots.append(cand_root)
+
+    # 1. Discover Copilot CLI SQLite session stores, session-state/*/events.jsonl, and JetBrains jb/*
+    cli_db_paths: list[str] = []
+    cli_event_files: list[str] = []
+    jb_conv_dirs: list[Path] = []
+    seen_jb_ids: set[str] = set()
+
+    for croot in copilot_roots:
+        for cand_db in (croot / "state" / "session-store.db", croot / "session-store.db"):
+            if cand_db.is_file():
+                cli_db_paths.append(str(cand_db))
+                break
+        sess_state_root = croot / "session-state"
+        if sess_state_root.is_dir():
+            cli_event_files.extend(sorted(glob.glob(str(sess_state_root / "*" / "events.jsonl"))))
+        jb_root = croot / "jb"
+        if jb_root.is_dir():
+            try:
+                for entry in sorted(jb_root.iterdir(), key=lambda x: x.name):
+                    if entry.is_dir() and entry.name not in seen_jb_ids:
+                        seen_jb_ids.add(entry.name)
+                        jb_conv_dirs.append(entry)
+            except OSError:
+                pass
+
+    # 2. Discover VS Code / Insiders / VSCodium chatSessions/*.{jsonl,json} (live + backup `.config*` roots)
+    vsc_tasks: list[tuple[str, str]] = []  # (file_path, workspace_uri)
+    chat_log_files: list[str] = []
+    ed_names = ("Code", "Code - Insiders", "VSCodium")
+    backup_roots = get_backup_roots()
+    backup_cfg_dirs: list[Path] = []
+    for b in backup_roots:
+        try:
+            backup_cfg_dirs.extend(sorted(d for d in b.glob(".config*") if d.is_dir()))
+        except OSError:
+            pass
+    cand_editor_roots = [
+        *[HOME / ".config" / ed / "User" for ed in ed_names],
+        *[HOME / "Library" / "Application Support" / ed / "User" for ed in ed_names],
+        *[cfg_d / ed / "User" for cfg_d in backup_cfg_dirs for ed in ed_names],
+        *[b / ed / "User" for b in backup_roots for ed in ed_names],
+        *[b / "User" for b in backup_roots],
+    ]
+    editor_roots: list[Path] = []
+    seen_ed_roots: set[Path] = set()
+    for er in cand_editor_roots:
+        if not er.is_dir():
+            continue
+        try:
+            erp = er.resolve()
+        except OSError:
+            erp = er
+        if erp not in seen_ed_roots:
+            seen_ed_roots.add(erp)
+            editor_roots.append(er)
+
+    def _collect_chat_dir(chat_dir: Path, ws_uri: str) -> None:
+        if not chat_dir.is_dir():
+            return
+        try:
+            entries = sorted(chat_dir.iterdir(), key=lambda x: x.name)
+        except OSError:
+            return
+        jsonl_stems = {e.stem for e in entries if e.suffix == ".jsonl" and e.is_file()}
+        for e in entries:
+            if not e.is_file():
+                continue
+            if e.suffix == ".jsonl":
+                vsc_tasks.append((str(e), ws_uri))
+            elif e.suffix == ".json" and e.stem not in jsonl_stems:
+                vsc_tasks.append((str(e), ws_uri))
+
+    seen_log_dirs: set[Path] = set()
+    for user_root in editor_roots:
+        if not user_root.is_dir():
+            continue
+        ws_storage = user_root / "workspaceStorage"
+        if ws_storage.is_dir():
+            try:
+                ws_dirs = sorted(ws_storage.iterdir(), key=lambda x: x.name)
+            except OSError:
+                ws_dirs = []
+            for wd in ws_dirs:
+                chat_dir = wd / "chatSessions"
+                if not chat_dir.is_dir():
+                    continue
+                ws_uri = ""
+                ws_json = wd / "workspace.json"
+                if ws_json.is_file():
+                    try:
+                        wobj = json.loads(ws_json.read_text(encoding="utf-8", errors="replace"))
+                        if isinstance(wobj, dict):
+                            ws_uri = str(wobj.get("folder") or wobj.get("workspace") or "")
+                    except (OSError, ValueError):
+                        pass
+                _collect_chat_dir(chat_dir, ws_uri)
+        _collect_chat_dir(user_root / "globalStorage" / "emptyWindowChatSessions", "")
+        logs_dir = user_root.parent / "logs"
+        if logs_dir.is_dir() and logs_dir not in seen_log_dirs:
+            seen_log_dirs.add(logs_dir)
+            try:
+                chat_log_files.extend(
+                    str(p) for p in sorted(logs_dir.rglob("GitHub Copilot Chat.log")) if p.is_file()
+                )
+            except OSError:
+                pass
+
+    cached_rows = {
+        row[0]: (row[1], row[2], row[3])
+        for row in cache_con.execute(
+            "SELECT path, mtime_ns, size, payload_json FROM file_cache WHERE harness = 'copilot'"
+        )
+    }
+
+    active_paths: set[str] = set()
+    cache_hits = 0
+    inserts: list[tuple[str, str, int, int, str]] = []
+
+    # Parse / load cached CLI SQLite DBs (live first, then backups)
+    db_sessions_meta: dict[str, dict[str, str]] = {}
+    db_calls_by_sid: dict[str, list[list[Any]]] = {}
+    files_parsed = 0
+    for db_p in cli_db_paths:
+        sig = _file_sig(db_p)
+        if sig is None:
+            continue
+        active_paths.add(db_p)
+        mtime_ns, size = sig
+        c_hit = cached_rows.get(db_p)
+        if c_hit and c_hit[0] == mtime_ns and c_hit[1] == size:
+            db_pl = json.loads(c_hit[2])
+            cache_hits += 1
+        else:
+            db_pl = _parse_copilot_store_db(db_p)
+            files_parsed += 1
+            inserts.append(("copilot", db_p, mtime_ns, size, json.dumps(db_pl, separators=(",", ":"))))
+        for k, v in (db_pl.get("sessions") or {}).items():
+            db_sessions_meta.setdefault(k, v)
+        for k, v in (db_pl.get("calls") or {}).items():
+            if k not in db_calls_by_sid or len(v) > len(db_calls_by_sid[k]):
+                db_calls_by_sid[k] = v
+
+    # Parse / load cached CLI events.jsonl (keeping richest payload per sid, tie-breaking to live)
+    cli_payloads: dict[str, dict[str, Any]] = {}
+    to_parse_cli: list[tuple[str, int, int]] = []
+
+    def _merge_cli_pl(sid_key: str, pl_obj: dict[str, Any]) -> None:
+        prev = cli_payloads.get(sid_key)
+        if prev is None or len(pl_obj.get("calls") or []) > len(prev.get("calls") or []):
+            cli_payloads[sid_key] = pl_obj
+
+    for ep in cli_event_files:
+        sig = _file_sig(ep)
+        if sig is None:
+            continue
+        active_paths.add(ep)
+        mtime_ns, size = sig
+        c_hit = cached_rows.get(ep)
+        if c_hit and c_hit[0] == mtime_ns and c_hit[1] == size:
+            pl = json.loads(c_hit[2])
+            _merge_cli_pl(pl.get("sid") or Path(ep).parent.name, pl)
+            cache_hits += 1
+        else:
+            to_parse_cli.append((ep, mtime_ns, size))
+
+    if to_parse_cli:
+        c_paths = [x[0] for x in to_parse_cli]
+        fresh_cli = (
+            list(pool.map(_parse_copilot_cli_events, c_paths, chunksize=20))
+            if pool
+            else [_parse_copilot_cli_events(x) for x in c_paths]
+        )
+        files_parsed += len(to_parse_cli)
+        for (ep, mtime_ns, size), pl in zip(to_parse_cli, fresh_cli):
+            _merge_cli_pl(pl.get("sid") or Path(ep).parent.name, pl)
+            inserts.append(("copilot", ep, mtime_ns, size, json.dumps(pl, separators=(",", ":"))))
+
+    # Parse / load cached JetBrains Copilot `jb/<cid>/partition-*.jsonl`
+    jb_payloads: list[dict[str, Any]] = []
+    to_parse_jb: list[tuple[str, int, int]] = []
+    for jdir in jb_conv_dirs:
+        jsig = _jb_dir_sig(jdir)
+        if jsig is None:
+            continue
+        jkey = str(jdir)
+        active_paths.add(jkey)
+        mtime_ns, size = jsig
+        c_hit = cached_rows.get(jkey)
+        if c_hit and c_hit[0] == mtime_ns and c_hit[1] == size:
+            jb_payloads.append(json.loads(c_hit[2]))
+            cache_hits += 1
+        else:
+            to_parse_jb.append((jkey, mtime_ns, size))
+
+    if to_parse_jb:
+        j_paths = [x[0] for x in to_parse_jb]
+        fresh_jb = (
+            list(pool.map(_parse_jetbrains_copilot_conv, j_paths, chunksize=20))
+            if pool
+            else [_parse_jetbrains_copilot_conv(x) for x in j_paths]
+        )
+        files_parsed += len(to_parse_jb)
+        for (jkey, mtime_ns, size), pl in zip(to_parse_jb, fresh_jb):
+            jb_payloads.append(pl)
+            inserts.append(("copilot", jkey, mtime_ns, size, json.dumps(pl, separators=(",", ":"))))
+
+    # Parse / load cached VS Code chatSessions
+    vsc_payloads: list[dict[str, Any]] = []
+    to_parse_vsc: list[tuple[str, str, int, int]] = []
+    for vp, ws_uri in vsc_tasks:
+        sig = _file_sig(vp)
+        if sig is None:
+            continue
+        active_paths.add(vp)
+        mtime_ns, size = sig
+        c_hit = cached_rows.get(vp)
+        if c_hit and c_hit[0] == mtime_ns and c_hit[1] == size:
+            pl = json.loads(c_hit[2])
+            if ws_uri and not pl.get("cwd"):
+                pl["cwd"] = ws_uri
+            vsc_payloads.append(pl)
+            cache_hits += 1
+        else:
+            to_parse_vsc.append((vp, ws_uri, mtime_ns, size))
+
+    if to_parse_vsc:
+        v_args = [(x[0], x[1]) for x in to_parse_vsc]
+        fresh_vsc = (
+            list(pool.map(_parse_vscode_copilot_session, v_args, chunksize=25))
+            if pool
+            else [_parse_vscode_copilot_session(x) for x in v_args]
+        )
+        files_parsed += len(to_parse_vsc)
+        for (vp, _ws_uri, mtime_ns, size), pl in zip(to_parse_vsc, fresh_vsc):
+            vsc_payloads.append(pl)
+            inserts.append(("copilot", vp, mtime_ns, size, json.dumps(pl, separators=(",", ":"))))
+
+    # Parse / load cached VS Code `GitHub Copilot Chat.log` SKU billing telemetry
+    sku_dates: dict[str, list[str]] = defaultdict(list)
+    to_parse_logs: list[tuple[str, int, int]] = []
+    for lp in chat_log_files:
+        sig = _file_sig(lp)
+        if sig is None:
+            continue
+        active_paths.add(lp)
+        mtime_ns, size = sig
+        c_hit = cached_rows.get(lp)
+        if c_hit and c_hit[0] == mtime_ns and c_hit[1] == size:
+            lpl = json.loads(c_hit[2])
+            for d_iso, sku_s in lpl.get("samples") or []:
+                sku_dates[str(sku_s)].append(str(d_iso))
+            cache_hits += 1
+        else:
+            to_parse_logs.append((lp, mtime_ns, size))
+
+    if to_parse_logs:
+        l_paths = [x[0] for x in to_parse_logs]
+        fresh_logs = (
+            list(pool.map(_parse_copilot_chat_log, l_paths, chunksize=20))
+            if pool
+            else [_parse_copilot_chat_log(x) for x in l_paths]
+        )
+        files_parsed += len(to_parse_logs)
+        for (lp, mtime_ns, size), lpl in zip(to_parse_logs, fresh_logs):
+            for d_iso, sku_s in lpl.get("samples") or []:
+                sku_dates[str(sku_s)].append(str(d_iso))
+            inserts.append(("copilot", lp, mtime_ns, size, json.dumps(lpl, separators=(",", ":"))))
+
+    sku_segments = [
+        {"sku": sku, "first_date": min(ds), "last_date": max(ds)}
+        for sku, ds in sorted(sku_dates.items(), key=lambda kv: (min(kv[1]), kv[0]))
+        if ds
+    ]
+
+    if inserts:
+        cache_con.executemany(
+            "INSERT OR REPLACE INTO file_cache(harness, path, mtime_ns, size, payload_json) VALUES (?, ?, ?, ?, ?)",
+            inserts,
+        )
+        cache_con.commit()
+
+    _prune_file_cache(cache_con, "copilot", active_paths, set(cached_rows.keys()))
+
+    cube_acc: dict[tuple[str, str, str, str, str, str, int], list[float]] = defaultdict(
+        lambda: [0, 0, 0, 0, 0, 0, 0.0]
+    )
+    sessions_out: list[dict[str, Any]] = []
+    project_raw_paths: dict[str, set[str]] = defaultdict(set)
+    timelines = new_timelines()
+    total_calls = 0
+    premium_requests = 0.0
+    cli_sessions_count = 0
+    jetbrains_sessions_count = 0
+    vscode_sessions_count = 0
+    min_date, max_date = "9999-99-99", "0000-00-00"
+
+    def _emit_session_group(
+        sid: str,
+        parent_sid: str,
+        raw_cwd: str,
+        base_title: str,
+        fallback_date: str,
+        raw_calls: list[list[Any]],
+        client_label: str = "Copilot CLI",
+        force_subagent: bool = False,
+    ) -> bool:
+        nonlocal total_calls, premium_requests, min_date, max_date
+        if not raw_calls:
+            return False
+        proj, clean_path = normalize_project(raw_cwd)
+        if clean_path:
+            project_raw_paths[proj].add(clean_path)
+
+        # Group calls into main session + any subagent lanes (`sub_k`)
+        by_agent: dict[str, list[list[Any]]] = defaultdict(list)
+        for c in raw_calls:
+            sub_k = str(c[10] or "")
+            if sub_k and not parent_sid and not force_subagent:
+                ag_sid = f"{sid}:sub:{sub_k}"
+            else:
+                ag_sid = sid
+            by_agent[ag_sid].append(c)
+
+        emitted_any = False
+        for ag_sid, ag_calls in by_agent.items():
+            is_sub_lane = ag_sid != sid or bool(parent_sid) or force_subagent
+            ag_parent = sid if ag_sid != sid else parent_sid
+            actor = "subagent" if is_sub_lane else "main"
+
+            s_calls = s_in = s_cr = s_cw = s_out = s_reas = 0
+            mp_toks: dict[tuple[str, str], int] = defaultdict(int)
+            mp_max_date: dict[tuple[str, str], str] = {}
+
+            for rec in ag_calls:
+                ts_val, raw_m, inp, cr, cw, out_txt, reas, mult, _init, eff, _sub_k = rec
+                if isinstance(ts_val, (int, float)):
+                    d_key = epoch_to_local_hour_key(ts_val)
+                else:
+                    d_key = iso_to_local_hour_key(str(ts_val))
+                eff_key = d_key if d_key != "unknown" else fallback_date
+                eff_date = hour_key_date(eff_key)
+                if eff_date != "unknown":
+                    min_date = min(min_date, eff_date)
+                    max_date = max(max_date, eff_date)
+
+                model, provider = normalize_model_and_provider(raw_m, None, "GitHub Copilot")
+                key = (eff_key, "GitHub Copilot", provider, model, proj, actor, 0)
+                tl = timelines[ag_sid]
+                tl["parent"] = ag_parent
+                tl["calls"].append([to_epoch_ms(ts_val), model, inp, cr, cw, out_txt, reas, 0.0, eff])
+
+                b = cube_acc[key]
+                b[0] += 1
+                b[1] += inp
+                b[2] += cr
+                b[3] += cw
+                b[4] += out_txt
+                b[5] += reas
+
+                s_calls += 1
+                s_in += inp
+                s_cr += cr
+                s_cw += cw
+                s_out += out_txt
+                s_reas += reas
+                premium_requests += float(mult or 0.0)
+                tok_sum = inp + cr + cw + out_txt + reas
+                mp = (model, provider)
+                mp_toks[mp] += tok_sum
+                prev_d = mp_max_date.get(mp)
+                if prev_d is None or (eff_date != "unknown" and (prev_d == "unknown" or eff_date > prev_d)):
+                    mp_max_date[mp] = eff_date
+                total_calls += 1
+
+            if s_in + s_cr + s_cw + s_out + s_reas > 0:
+                dom_model, dom_provider = max(mp_toks.items(), key=lambda kv: kv[1])[0]
+                dom_date = mp_max_date.get((dom_model, dom_provider), fallback_date)
+                if ag_sid != sid:
+                    lbl = f"Copilot subagent {ag_sid.rsplit(':', 1)[-1][:24]}"
+                else:
+                    lbl = (base_title or f"{client_label} {sid[:8]}").strip()
+                sessions_out.append(
+                    {
+                        "id": ag_sid,
+                        "harness": "GitHub Copilot",
+                        "title": lbl.replace("\n", " ")[:120],
+                        "project": proj,
+                        "model": dom_model,
+                        "provider": dom_provider,
+                        "actor": actor,
+                        "date": dom_date,
+                        "calls": s_calls,
+                        "input_uncached": s_in,
+                        "cache_read": s_cr,
+                        "cache_write": s_cw,
+                        "output_text": s_out,
+                        "reasoning": s_reas,
+                        "cost_usd": 0.0,
+                    }
+                )
+                emitted_any = True
+        return emitted_any
+
+    # Merge Copilot CLI sessions across session-store.db and session-state/*/events.jsonl
+    all_cli_sids = sorted(set(db_sessions_meta.keys()) | set(db_calls_by_sid.keys()) | set(cli_payloads.keys()))
+    emitted_sids: set[str] = set()
+    for sid in all_cli_sids:
+        db_m = db_sessions_meta.get(sid) or {}
+        ev_pl = cli_payloads.get(sid) or {}
+        parent_sid = str(ev_pl.get("parent_sid") or "")
+        raw_cwd = str(ev_pl.get("cwd") or db_m.get("cwd") or "")
+        if not raw_cwd and parent_sid:
+            p_ev = cli_payloads.get(parent_sid) or {}
+            p_db = db_sessions_meta.get(parent_sid) or {}
+            raw_cwd = str(p_ev.get("cwd") or p_db.get("cwd") or "")
+        title = str(
+            ev_pl.get("title")
+            or db_m.get("summary")
+            or db_m.get("prompt")
+            or ""
+        )
+        fallback_iso = str(
+            ev_pl.get("last_ts")
+            or db_m.get("updated_at")
+            or ev_pl.get("start_time")
+            or db_m.get("created_at")
+            or ""
+        )
+        fallback_date = iso_to_local_date(fallback_iso)
+
+        # Prefer per-turn SQLite `assistant_usage_events`; otherwise use segment-reconciled `events.jsonl` turns
+        from_db = bool(db_calls_by_sid.get(sid))
+        calls = list(db_calls_by_sid.get(sid) or ev_pl.get("calls") or [])
+
+        # Reconcile SQLite `db_calls_by_sid` against `session.shutdown` totals (events.jsonl payloads are already segment-reconciled)
+        shutdown_metrics = ev_pl.get("shutdown_metrics") or {}
+        if shutdown_metrics and (from_db or not ev_pl.get("segments_reconciled")):
+            recorded_by_model: dict[str, list[float]] = defaultdict(lambda: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+            for c in calls:
+                rm = str(c[1])
+                rec_m = recorded_by_model[rm]
+                rec_m[0] += float(c[7] or 0.0)
+                rec_m[1] += c[2]
+                rec_m[2] += c[3]
+                rec_m[3] += c[4]
+                rec_m[4] += c[5]
+                rec_m[5] += c[6]
+            sh_ts = str(ev_pl.get("shutdown_ts") or fallback_iso)
+            def_eff = str(ev_pl.get("default_effort") or "")
+            for rm, vals in shutdown_metrics.items():
+                _r_cnt, r_cost, m_inp, m_cr, m_cw, m_out, m_reas = vals
+                got = recorded_by_model.get(rm) or [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+                d_inp = max(0, int(m_inp - got[1]))
+                d_cr = max(0, int(m_cr - got[2]))
+                d_cw = max(0, int(m_cw - got[3]))
+                d_out = max(0, int(m_out - got[4]))
+                d_reas = max(0, int(m_reas - got[5]))
+                d_mult = max(0.0, float(r_cost - got[0]))
+                if d_inp + d_cr + d_cw + d_out + d_reas > 0:
+                    calls.append([sh_ts, rm, d_inp, d_cr, d_cw, d_out, d_reas, d_mult, "user", def_eff, ""])
+
+        if _emit_session_group(sid, parent_sid, raw_cwd, title, fallback_date, calls, client_label="Copilot CLI"):
+            emitted_sids.add(sid)
+            cli_sessions_count += 1
+
+    # Emit JetBrains GitHub Copilot conversations (`jb/<cid>/partition-*.jsonl`), linking subagent windows
+    jb_parents = [pl for pl in jb_payloads if pl.get("has_partition_created")]
+    for pl in jb_payloads:
+        sid = str(pl.get("sid") or "")
+        if not sid or sid in emitted_sids:
+            continue
+        calls = pl.get("calls") or []
+        if not calls:
+            continue
+        is_sub = not bool(pl.get("has_partition_created"))
+        parent_sid = ""
+        raw_cwd = str(pl.get("cwd") or "")
+        base_title = str(pl.get("title") or "")
+        if is_sub:
+            sub_st = int(pl.get("start_ms") or 0)
+            for p_cand in jb_parents:
+                for win in p_cand.get("subagent_windows") or []:
+                    w_st, w_end, ag_lbl = int(win[0] or 0), int(win[1] or 0), str(win[2] or "subagent")
+                    if sub_st and w_st and (w_st - 5000 <= sub_st <= w_end + 5000):
+                        parent_sid = str(p_cand.get("sid") or "")
+                        if not raw_cwd:
+                            raw_cwd = str(p_cand.get("cwd") or "")
+                        if not base_title:
+                            base_title = f"JetBrains Copilot {ag_lbl} ({sid[:8]})"
+                        break
+                if parent_sid:
+                    break
+            if not base_title:
+                base_title = f"JetBrains Copilot subagent {sid[:8]}"
+
+        fallback_date = epoch_to_local_date(pl.get("created_ms") or pl.get("start_ms") or 0)
+        if _emit_session_group(
+            sid,
+            parent_sid,
+            raw_cwd,
+            base_title,
+            fallback_date,
+            calls,
+            client_label="JetBrains Copilot",
+            force_subagent=is_sub,
+        ):
+            emitted_sids.add(sid)
+            jetbrains_sessions_count += 1
+
+    # Deduplicate VS Code chatSessions across migrated workspaceStorage directories by `sid`,
+    # selecting the richest call stream and adopting any resolved non-(unassigned) project path.
+    vsc_by_sid: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for pl in vsc_payloads:
+        sid_k = str(pl.get("sid") or "")
+        if sid_k:
+            vsc_by_sid[sid_k].append(pl)
+
+    for sid, group in vsc_by_sid.items():
+        if sid in emitted_sids:
+            continue
+        best_pl = max(
+            group,
+            key=lambda p: (
+                len(p.get("calls") or []),
+                sum(sum(c[2:7]) for c in (p.get("calls") or [])),
+            ),
+        )
+        calls = best_pl.get("calls") or []
+        if not calls:
+            continue
+        best_cwd = str(best_pl.get("cwd") or "")
+        if normalize_project(best_cwd)[0] == "(unassigned)":
+            for sib in group:
+                sib_cwd = str(sib.get("cwd") or "")
+                if sib_cwd and normalize_project(sib_cwd)[0] != "(unassigned)":
+                    best_cwd = sib_cwd
+                    break
+        best_title = str(best_pl.get("title") or "")
+        if not best_title:
+            for sib in group:
+                if sib.get("title"):
+                    best_title = str(sib["title"])
+                    break
+        fallback_date = epoch_to_local_date(best_pl.get("creation_ms") or 0)
+        if _emit_session_group(
+            sid,
+            "",
+            best_cwd,
+            best_title,
+            fallback_date,
+            calls,
+            client_label="VS Code Copilot",
+        ):
+            emitted_sids.add(sid)
+            vscode_sessions_count += 1
+
+    elapsed_ms = round((time.time() - t0) * 1000, 1)
+    return {
+        "cube": cube_acc,
+        "sessions": sessions_out,
+        "timelines": timelines,
+        "project_paths": project_raw_paths,
+        "copilot_billing": {
+            "premium_requests": round(premium_requests, 2),
+            "cli_sessions": cli_sessions_count,
+            "jetbrains_sessions": jetbrains_sessions_count,
+            "vscode_sessions": vscode_sessions_count,
+            "sku_segments": sku_segments,
+            "overage_rate_per_request_usd": 0.04,
+        },
+        "health": {
+            "harness": "GitHub Copilot",
+            "source_path": "~/.copilot (session-store.db, session-state, jb) + VS Code chatSessions",
+            "files_total": len(active_paths),
+            "cache_hits": cache_hits,
+            "files_parsed": files_parsed,
+            "sessions_count": len(sessions_out),
+            "api_calls": total_calls,
+            "live_date_range": f"{min_date} .. {max_date}" if sessions_out else "n/a",
+            "elapsed_ms": elapsed_ms,
+        },
+    }
+
+
+# ---------------------------------------------------------------------------
 # Reference API Rate Estimator Defaults ($ per 1M tokens)
 # ---------------------------------------------------------------------------
 
@@ -2530,6 +4594,16 @@ def default_model_pricing(model: str, provider: str) -> dict[str, Any]:
         return {"in": 5.00, "cr": 0.50, "cw": 6.25, "out": 25.00, "note": "Fable frontier tier"}
     if "codex-auto-review" in ml or "luna" in ml:
         return {"in": 1.25, "cr": 0.125, "cw": 1.25, "out": 5.00, "note": "Fast/review tier estimate"}
+    if ml == "raptor-mini" or (ml.startswith("gpt-") and ("mini" in ml or "nano" in ml)):
+        return {"in": 0.40, "cr": 0.04, "cw": 0.40, "out": 1.60, "note": "GPT mini tier estimate"}
+    if "grok-code" in ml:
+        return {"in": 0.20, "cr": 0.05, "cw": 0.20, "out": 1.50, "note": "Grok Code Fast tier estimate"}
+    if "grok" in ml:
+        return {"in": 2.00, "cr": 0.50, "cw": 2.00, "out": 6.00, "note": "Grok tier estimate"}
+    if "kimi" in ml:
+        return {"in": 3.00, "cr": 0.30, "cw": 3.00, "out": 15.00, "note": "Kimi K3 tier estimate"}
+    if ml.startswith("mai-"):
+        return {"in": 0.20, "cr": 0.02, "cw": 0.20, "out": 1.20, "note": "MAI Flash tier estimate"}
     if "terra" in ml or "sol" in ml or "astra" in ml or ml.startswith("gpt-"):
         return {"in": 2.50, "cr": 0.25, "cw": 2.50, "out": 10.00, "note": "GPT frontier tier estimate"}
     if "gemini" in ml and "flash" in ml:
@@ -2580,10 +4654,37 @@ def _count_renewal_dates(start_iso: str, end_iso: str) -> list[str]:
     return out or [start_iso]
 
 
+def _count_annual_renewal_dates(start_iso: str, end_iso: str) -> tuple[list[str], str]:
+    """Return `(annual_renewal_dates, cycle_end_iso)` starting at `start_iso` up through `end_iso`."""
+    try:
+        sd = dt.date.fromisoformat(start_iso)
+        ed = dt.date.fromisoformat(end_iso)
+    except ValueError:
+        return ([start_iso], end_iso)
+    if ed < sd:
+        ed = sd
+    out: list[str] = []
+    cur_y = sd.year
+    while True:
+        last_dom = (dt.date(cur_y, 3, 1) - dt.timedelta(days=1)).day if sd.month == 2 else sd.day
+        cyc = dt.date(cur_y, sd.month, min(sd.day, last_dom))
+        if cyc > ed:
+            next_start = cyc
+            break
+        out.append(cyc.isoformat())
+        cur_y += 1
+    if not out:
+        out = [sd.isoformat()]
+        last_dom_n = (dt.date(sd.year + 1, 3, 1) - dt.timedelta(days=1)).day if sd.month == 2 else sd.day
+        next_start = dt.date(sd.year + 1, sd.month, min(sd.day, last_dom_n))
+    return (out, (next_start - dt.timedelta(days=1)).isoformat())
+
+
 def build_billing_summary(
     claude_res: dict[str, Any],
     codex_res: dict[str, Any],
     oc_res: dict[str, Any],
+    copilot_res: dict[str, Any],
     cube_rows: list[list[Any]],
     default_rates: dict[str, dict[str, Any]],
 ) -> dict[str, Any]:
@@ -2594,6 +4695,7 @@ def build_billing_summary(
     c_meta = claude_res.get("billing_meta") or {}
     codex_wallet = codex_res.get("codex_wallet") or {}
     oc_bill = oc_res.get("opencode_billing") or {}
+    cop_bill = copilot_res.get("copilot_billing") or {}
 
     # Analyze Claude Code weekly API-equivalent trajectory, burst days, and Fable overage volume
     claude_weekly_usd: dict[str, float] = defaultdict(float)
@@ -2604,6 +4706,7 @@ def build_billing_summary(
     fable_api_usd = 0.0
     min_claude_d, max_claude_d = "9999-99-99", "0000-00-00"
     min_ag_d, max_ag_d = "9999-99-99", "0000-00-00"
+    min_cop_d, max_cop_d = "9999-99-99", "0000-00-00"
 
     for r in cube_rows:
         d_s, harness, _prov, model, _proj, _actor, _arch = r[:7]
@@ -2611,6 +4714,9 @@ def build_billing_summary(
         if harness == "Antigravity" and d_s != "unknown":
             min_ag_d = min(min_ag_d, d_s)
             max_ag_d = max(max_ag_d, d_s)
+        if harness == "GitHub Copilot" and d_s != "unknown":
+            min_cop_d = min(min_cop_d, d_s)
+            max_cop_d = max(max_cop_d, d_s)
         if harness != "Claude Code" or d_s == "unknown":
             continue
         min_claude_d = min(min_claude_d, d_s)
@@ -2918,6 +5024,152 @@ def build_billing_summary(
                 }
             )
 
+    # 7. GitHub Copilot Subscriptions & Premium Request Overages (only emitted when Copilot usage exists)
+    if min_cop_d <= max_cop_d:
+        cop_start = min_cop_d
+        cop_end = max_cop_d
+        prem_reqs = float(cop_bill.get("premium_requests") or 0.0)
+        cop_cfg = cfg.get("copilot_plan") if isinstance(cfg.get("copilot_plan"), dict) else None
+        if cop_cfg and cop_cfg.get("start_date"):
+            c_paid_start = str(cop_cfg["start_date"])
+            c_monthly = float(cop_cfg.get("monthly_usd") or 10.0)
+            c_paid_end = max(c_paid_start, cop_end, today_iso)
+            c_renewals = _count_renewal_dates(c_paid_start, c_paid_end) or [c_paid_start]
+            c_paid_usd = round(len(c_renewals) * c_monthly, 2)
+            default_ledger.append(
+                {
+                    "id": "copilot_sub_paid",
+                    "harness": "GitHub Copilot",
+                    "category": "subscription",
+                    "label": f"GitHub Copilot Plan ({len(c_renewals)} {'cycle' if len(c_renewals) == 1 else 'cycles'} @ ${c_monthly:.0f}/mo)",
+                    "start_date": c_paid_start,
+                    "end_date": c_paid_end,
+                    "amount_usd": c_paid_usd,
+                    "consumed_usd": c_paid_usd,
+                    "remaining_usd": 0.0,
+                    "promo_value_usd": 0.0,
+                    "source": "user_calibrated",
+                    "detail": (
+                        f"Configured ${c_monthly:.0f}/mo GitHub Copilot plan starting {c_paid_start} "
+                        f"({prem_reqs:,.1f} premium requests logged)."
+                    ),
+                }
+            )
+        else:
+            sku_segs = cop_bill.get("sku_segments") or []
+            by_sku = {str(s["sku"]): s for s in sku_segs if isinstance(s, dict) and s.get("sku")}
+            trial_seg = by_sku.get("trial_30_yearly_subscriber_quota") or by_sku.get("trial_30_monthly_subscriber_quota")
+            yearly_seg = by_sku.get("yearly_subscriber_quota")
+            monthly_seg = by_sku.get("monthly_subscriber_quota")
+            plus_seg = by_sku.get("plus_monthly_subscriber_quota") or by_sku.get("pro_plus_monthly_subscriber_quota")
+            emitted_cop_sku = False
+            trial_end_after = ""
+
+            if trial_seg:
+                t_start = str(trial_seg.get("first_date") or cop_start)
+                try:
+                    t_sd = dt.date.fromisoformat(t_start)
+                    t_end = (t_sd + dt.timedelta(days=29)).isoformat()
+                    trial_end_after = (t_sd + dt.timedelta(days=30)).isoformat()
+                except ValueError:
+                    t_end = str(trial_seg.get("last_date") or t_start)
+                    trial_end_after = t_end
+                default_ledger.append(
+                    {
+                        "id": "copilot_sub_trial",
+                        "harness": "GitHub Copilot",
+                        "category": "subscription",
+                        "label": "GitHub Copilot Pro (30-Day Free Trial)",
+                        "start_date": t_start,
+                        "end_date": t_end,
+                        "amount_usd": 0.0,
+                        "consumed_usd": 0.0,
+                        "remaining_usd": 0.0,
+                        "promo_value_usd": 0.0,
+                        "source": "extracted",
+                        "detail": (
+                            f"Extracted from `GitHub Copilot Chat.log` (`sku: {trial_seg['sku']}`, "
+                            f"{trial_seg.get('first_date')} .. {trial_seg.get('last_date')}); $0 30-day free trial."
+                        ),
+                    }
+                )
+                emitted_cop_sku = True
+
+            if yearly_seg:
+                y_start = trial_end_after or min(cop_start, str(yearly_seg.get("first_date") or cop_start))
+                y_horizon = max(cop_end, str(yearly_seg.get("last_date") or cop_end))
+                y_renewals, y_cycle_end = _count_annual_renewal_dates(y_start, y_horizon)
+                y_usd = round(len(y_renewals) * 100.0, 2)
+                default_ledger.append(
+                    {
+                        "id": "copilot_sub_yearly",
+                        "harness": "GitHub Copilot",
+                        "category": "subscription",
+                        "label": f"GitHub Copilot Pro Annual Plan ({len(y_renewals)} {'yr' if len(y_renewals) == 1 else 'yrs'} @ $100/yr)",
+                        "start_date": y_start,
+                        "end_date": y_cycle_end,
+                        "amount_usd": y_usd,
+                        "consumed_usd": y_usd,
+                        "remaining_usd": 0.0,
+                        "promo_value_usd": 0.0,
+                        "source": "extracted",
+                        "detail": (
+                            f"Extracted from `GitHub Copilot Chat.log` (`sku: yearly_subscriber_quota`, "
+                            f"seen through {yearly_seg.get('last_date')}); {prem_reqs:,.1f} premium requests logged."
+                        ),
+                    }
+                )
+                emitted_cop_sku = True
+            elif plus_seg or monthly_seg:
+                m_seg = plus_seg or monthly_seg
+                m_rate = 39.0 if plus_seg else 10.0
+                m_tier = "Pro+" if plus_seg else "Pro"
+                m_start = trial_end_after or min(cop_start, str(m_seg.get("first_date") or cop_start))
+                m_end = max(cop_end, str(m_seg.get("last_date") or cop_end))
+                m_renewals = _count_renewal_dates(m_start, m_end) or [m_start]
+                m_usd = round(len(m_renewals) * m_rate, 2)
+                default_ledger.append(
+                    {
+                        "id": "copilot_sub_monthly",
+                        "harness": "GitHub Copilot",
+                        "category": "subscription",
+                        "label": f"GitHub Copilot {m_tier} ({len(m_renewals)} {'cycle' if len(m_renewals) == 1 else 'cycles'} @ ${m_rate:.0f}/mo)",
+                        "start_date": m_start,
+                        "end_date": m_end,
+                        "amount_usd": m_usd,
+                        "consumed_usd": m_usd,
+                        "remaining_usd": 0.0,
+                        "promo_value_usd": 0.0,
+                        "source": "extracted",
+                        "detail": (
+                            f"Extracted from `GitHub Copilot Chat.log` (`sku: {m_seg['sku']}`); "
+                            f"{prem_reqs:,.1f} premium requests logged."
+                        ),
+                    }
+                )
+                emitted_cop_sku = True
+
+            if not emitted_cop_sku:
+                default_ledger.append(
+                    {
+                        "id": "copilot_sub",
+                        "harness": "GitHub Copilot",
+                        "category": "subscription",
+                        "label": "GitHub Copilot Plan / Premium Requests",
+                        "start_date": cop_start,
+                        "end_date": cop_end,
+                        "amount_usd": 0.0,
+                        "consumed_usd": 0.0,
+                        "remaining_usd": 0.0,
+                        "promo_value_usd": 0.0,
+                        "source": "extracted",
+                        "detail": (
+                            f"Logged {prem_reqs:,.1f} premium requests across Copilot sessions "
+                            f"(Pro $10/mo or $100/yr, Pro+ $39/mo, overages @ $0.04/premium request); edit to attribute your plan."
+                        ),
+                    }
+                )
+
     saved_overrides = load_billing_overrides()
 
     return {
@@ -2936,6 +5188,7 @@ def build_billing_summary(
             "overage_day_weights": claude_overage_day_weights,
         },
         "opencode_telemetry": oc_bill,
+        "copilot_telemetry": cop_bill,
     }
 
 
@@ -3110,6 +5363,7 @@ def _extract_all_locked(rebuild: bool = False) -> dict[str, Any]:
         claude_res = extract_claude(cache_con, pool)
         codex_res = extract_codex(cache_con, pool)
         ag_res = extract_antigravity(cache_con, pool)
+        copilot_res = extract_copilot(cache_con, pool)
 
     oc_res = extract_opencode(cache_con)
     cache_con.close()
@@ -3126,7 +5380,7 @@ def _extract_all_locked(rebuild: bool = False) -> dict[str, Any]:
     hourly_acc: dict[tuple[tuple[str, str, str, str, str, str, int], int], list[float]] = defaultdict(
         lambda: [0, 0, 0, 0, 0, 0, 0.0]
     )
-    for res in (claude_res, codex_res, oc_res, ag_res):
+    for res in (claude_res, codex_res, oc_res, ag_res, copilot_res):
         for k, vals in res["cube"].items():
             date_s, hour = split_hour_key(k[0])
             day_k = (date_s, *k[1:])
@@ -3206,9 +5460,9 @@ def _extract_all_locked(rebuild: bool = False) -> dict[str, Any]:
     default_rates = {
         m: default_model_pricing(m, prov) for m, prov in sorted(distinct_models.items())
     }
-    billing_summary = build_billing_summary(claude_res, codex_res, oc_res, cube_rows, default_rates)
+    billing_summary = build_billing_summary(claude_res, codex_res, oc_res, copilot_res, cube_rows, default_rates)
     session_detail_stats = build_session_details(
-        [claude_res, codex_res, oc_res, ag_res], all_sessions, default_rates
+        [claude_res, codex_res, oc_res, ag_res, copilot_res], all_sessions, default_rates
     )
 
     total_ms = round((time.time() - t_start) * 1000, 1)
@@ -3283,7 +5537,7 @@ def print_summary(payload: dict[str, Any]) -> None:
 
     for h in payload["source_health"]:
         print(
-            f"  • {h['harness']:<12} | sessions={h.get('sessions_count', 0):>5,} | calls={h.get('api_calls', 0):>7,} "
+            f"  • {h['harness']:<14} | sessions={h.get('sessions_count', 0):>5,} | calls={h.get('api_calls', 0):>7,} "
             f"| sources={h.get('files_total', 0):>4} (cache={h.get('cache_hits', 0):>4}) | {h.get('elapsed_ms', 0):>6.1f} ms | {h.get('live_date_range', '')}"
         )
 
