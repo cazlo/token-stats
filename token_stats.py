@@ -27,6 +27,7 @@ from concurrent.futures import ProcessPoolExecutor
 import datetime as dt
 import errno
 import glob
+import hashlib
 from http import HTTPStatus
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 import json
@@ -55,11 +56,13 @@ BILLING_OVERRIDES_PATH = DATA_DIR / "billing_overrides.json"
 LOCAL_CONFIG_PATH = DATA_DIR / "local_config.json"
 SERVER_PID_PATH = DATA_DIR / "server.pid"
 WEB_DATA_JS_PATH = WEB_DIR / "data.js"
+SESSION_DETAIL_DIR = WEB_DIR / "sessions"
+SESSION_DETAIL_MANIFEST_PATH = DATA_DIR / "session_details_manifest.json"
 
 HOME = Path.home()
 LOCAL_TZ = dt.datetime.now().astimezone().tzinfo
 
-CACHE_SCHEMA_VERSION = "6"
+CACHE_SCHEMA_VERSION = "9"
 EXTRACT_LOCK = threading.Lock()
 _LOCAL_CFG_CACHE: tuple[int, dict[str, Any]] | None = None
 
@@ -131,6 +134,83 @@ def epoch_to_local_date(ts_sec: float | int | None) -> str:
         return dt.datetime.fromtimestamp(ts_sec, tz=LOCAL_TZ).strftime("%Y-%m-%d")
     except (OSError, OverflowError, ValueError):
         return "unknown"
+
+
+def epoch_to_local_hour_key(ts_sec: float | int | None) -> str:
+    """Local "YYYY-MM-DDTHH" bucket key for an epoch timestamp (seconds or ms), or "unknown"."""
+    if not ts_sec or ts_sec <= 0:
+        return "unknown"
+    if ts_sec > 1e11:
+        ts_sec = ts_sec / 1000.0
+    try:
+        return dt.datetime.fromtimestamp(ts_sec, tz=LOCAL_TZ).strftime("%Y-%m-%dT%H")
+    except (OSError, OverflowError, ValueError):
+        return "unknown"
+
+
+def iso_to_local_hour_key(iso_str: str | None) -> str:
+    """Local "YYYY-MM-DDTHH" bucket key for an ISO timestamp; falls back to a bare date or "unknown"."""
+    if not iso_str:
+        return "unknown"
+    s = iso_str.strip()
+    if len(s) >= 10 and s[4] == "-" and s[7] == "-":
+        try:
+            if s.endswith("Z"):
+                s = s[:-1] + "+00:00"
+            parsed = dt.datetime.fromisoformat(s)
+            if parsed.tzinfo is not None:
+                parsed = parsed.astimezone(LOCAL_TZ)
+            if len(s) <= 10:
+                return parsed.strftime("%Y-%m-%d")
+            return parsed.strftime("%Y-%m-%dT%H")
+        except ValueError:
+            return s[:10]
+    return "unknown"
+
+
+def to_epoch_ms(ts: Any) -> int:
+    """Epoch milliseconds from an epoch (s or ms) number or an ISO timestamp; 0 when unknown."""
+    if ts is None or ts == "":
+        return 0
+    if isinstance(ts, (int, float)):
+        if ts <= 0:
+            return 0
+        return int(ts if ts > 1e11 else ts * 1000)
+    s = str(ts).strip()
+    if s.replace(".", "", 1).isdigit():
+        return to_epoch_ms(float(s))
+    try:
+        if s.endswith("Z"):
+            s = s[:-1] + "+00:00"
+        parsed = dt.datetime.fromisoformat(s)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=LOCAL_TZ)
+        return int(parsed.timestamp() * 1000)
+    except (ValueError, OverflowError, OSError):
+        return 0
+
+
+def new_timelines() -> dict[str, dict[str, Any]]:
+    """Per-session call timelines: {session_id: {"parent": parent_session_id, "calls": [[ms, model, inp, cr, cw, out, reas, cost, effort], ...]}}.
+
+    `effort` is the model's reasoning-effort level for that call ("low", "high", ...) or "" when the harness doesn't log it.
+    """
+    return defaultdict(lambda: {"parent": "", "calls": []})
+
+
+def hour_key_date(key: str) -> str:
+    """Strip the hour suffix from a "YYYY-MM-DDTHH" (or bare date / "unknown") bucket key."""
+    return key[:10] if key and key != "unknown" else "unknown"
+
+
+def split_hour_key(key: str) -> tuple[str, int]:
+    """("YYYY-MM-DD", hour 0..23) from a bucket key; hour is -1 when unknown."""
+    if key and len(key) == 13 and key[10] == "T":
+        try:
+            return key[:10], int(key[11:13])
+        except ValueError:
+            return key[:10], -1
+    return hour_key_date(key), -1
 
 
 def iso_to_local_date(iso_str: str | None) -> str:
@@ -454,6 +534,8 @@ def _parse_claude_file(path: str) -> dict[str, Any]:
                 actor = "subagent" if (is_sub or o.get("isSidechain")) else "main"
                 model = m.get("model") or "unknown"
                 has_stop = 1 if m.get("stop_reason") else 0
+                # Claude Code logs the session effort setting and the effective per-turn effort
+                effort = str(o.get("perTurnEffort") or o.get("effort") or "")
 
                 # Handle Anthropic server-side model fallback (`usage.iterations` with `fallback_message`)
                 iters = u.get("iterations")
@@ -473,10 +555,10 @@ def _parse_claude_file(path: str) -> dict[str, Any]:
                         it_model = str(it.get("model") or model)
                         it_reas = reas if idx_it == len(iters) - 1 and reas <= it_out else 0
                         sub_recs.append(
-                            [f"{mid}#iter{idx_it}", it_model, ts, cwd, actor, it_in, it_cr, it_cw, max(0, it_out - it_reas), it_reas, has_stop]
+                            [f"{mid}#iter{idx_it}", it_model, ts, cwd, actor, it_in, it_cr, it_cw, max(0, it_out - it_reas), it_reas, has_stop, effort]
                         )
                 if not sub_recs:
-                    sub_recs = [[mid, model, ts, cwd, actor, inp, cr, cw, max(0, out_tot - reas), reas, has_stop]]
+                    sub_recs = [[mid, model, ts, cwd, actor, inp, cr, cw, max(0, out_tot - reas), reas, has_stop, effort]]
 
                 tot_out = sum(r[8] + r[9] for r in sub_recs)
                 tot_all = sum(r[5] + r[6] + r[7] + r[8] + r[9] for r in sub_recs)
@@ -575,6 +657,7 @@ def extract_claude(cache_con: sqlite3.Connection, pool: ProcessPoolExecutor | No
                 "cwd": payload.get("cwd") or "",
                 "is_sub": payload.get("is_sub", False),
                 "max_ts": payload.get("max_ts") or "",
+                "root": payload.get("root_session_id") or sid,
             }
         else:
             if not session_meta[sid]["title"] and payload.get("title"):
@@ -596,9 +679,11 @@ def extract_claude(cache_con: sqlite3.Connection, pool: ProcessPoolExecutor | No
     max_live_date = "0000-00-00"
     project_raw_paths: dict[str, set[str]] = defaultdict(set)
 
+    timelines = new_timelines()
     for sid, rec in global_calls.values():
         model_raw, ts, cwd, actor, inp, cr, cw, out_txt, reas = rec[:9]
-        date_str = iso_to_local_date(ts)
+        hour_key = iso_to_local_hour_key(ts)
+        date_str = hour_key_date(hour_key)
         if date_str != "unknown":
             if date_str < min_live_date:
                 min_live_date = date_str
@@ -609,7 +694,7 @@ def extract_claude(cache_con: sqlite3.Connection, pool: ProcessPoolExecutor | No
             project_raw_paths[proj].add(clean_path)
         model, provider = normalize_model_and_provider(model_raw, "anthropic", "Claude Code")
 
-        key = (date_str, "Claude Code", provider, model, proj, actor, 0)
+        key = (hour_key, "Claude Code", provider, model, proj, actor, 0)
         b = cube_acc[key]
         b[0] += 1
         b[1] += inp
@@ -617,6 +702,8 @@ def extract_claude(cache_con: sqlite3.Connection, pool: ProcessPoolExecutor | No
         b[3] += cw
         b[4] += out_txt
         b[5] += reas
+        call_effort = str(rec[10]) if len(rec) > 10 else ""
+        timelines[sid]["calls"].append([to_epoch_ms(ts), model, inp, cr, cw, out_txt, reas, 0.0, call_effort])
 
         s = sess_acc.get(sid)
         if s is None:
@@ -653,6 +740,10 @@ def extract_claude(cache_con: sqlite3.Connection, pool: ProcessPoolExecutor | No
         s["cache_write"] += cw
         s["output_text"] += out_txt
         s["reasoning"] += reas
+
+    for tl_sid, tl in timelines.items():
+        root = (session_meta.get(tl_sid) or {}).get("root") or tl_sid
+        tl["parent"] = root if root != tl_sid else ""
 
     for s in sess_acc.values():
         dom_mp = max(s["_mp_toks"].items(), key=lambda kv: kv[1])[0]
@@ -765,6 +856,7 @@ def extract_claude(cache_con: sqlite3.Connection, pool: ProcessPoolExecutor | No
     return {
         "cube": cube_acc,
         "sessions": list(sess_acc.values()),
+        "timelines": timelines,
         "project_paths": project_raw_paths,
         "billing_meta": claude_billing_meta,
         "health": {
@@ -794,6 +886,7 @@ def _parse_codex_rollout(path: str) -> dict[str, Any]:
     """
     opener = zstd.open if path.endswith(".zst") else open
     cur_model = ""
+    cur_effort = ""
     cur_cwd = ""
     meta_info: dict[str, Any] = {}
     compacted_totals: set[int] = set()
@@ -848,6 +941,9 @@ def _parse_codex_rollout(path: str) -> dict[str, Any]:
                             pl = ev.get("payload") or {}
                             if pl.get("model"):
                                 cur_model = pl["model"]
+                            eff = pl.get("effort") or pl.get("reasoning_effort")
+                            if eff:
+                                cur_effort = str(eff)
                             if pl.get("cwd") and not cur_cwd:
                                 cur_cwd = pl["cwd"]
                     except Exception:
@@ -909,7 +1005,7 @@ def _parse_codex_rollout(path: str) -> dict[str, Any]:
                         l_reas = int(ltu.get("reasoning_output_tokens") or 0)
                         l_tot = int(ltu.get("total_tokens") or (l_in + l_out))
 
-                        date_str = iso_to_local_date(ev.get("timestamp"))
+                        date_str = iso_to_local_hour_key(ev.get("timestamp"))
                         is_comp_base = 1 if c_tot in compacted_totals else 0
                         events.append(
                             [
@@ -928,6 +1024,8 @@ def _parse_codex_rollout(path: str) -> dict[str, Any]:
                                 l_reas,
                                 l_tot,
                                 is_comp_base,
+                                str(ev.get("timestamp") or ""),
+                                cur_effort,
                             ]
                         )
                     except Exception:
@@ -1143,6 +1241,7 @@ def extract_codex(cache_con: sqlite3.Connection, pool: ProcessPoolExecutor | Non
     )
 
     seen_cum: set[tuple[int, int, int, int, int, int]] = set()
+    timelines = new_timelines()
     cube_acc: dict[tuple[str, str, str, str, str, str, int], list[float]] = defaultdict(
         lambda: [0, 0, 0, 0, 0, 0, 0.0]
     )
@@ -1168,6 +1267,8 @@ def extract_codex(cache_con: sqlite3.Connection, pool: ProcessPoolExecutor | Non
             _thread_source,
             _parent_id,
         ) = row
+        tl_meta = ((file_payloads.get(thread_files.get(tid, "")) or {}).get("meta")) or {}
+        tl_parent = str(_parent_id or tl_meta.get("parent_thread_id") or tl_meta.get("forked_from_id") or "")
 
         actual = thread_files.get(tid)
         payload = file_payloads.get(actual) if actual else None
@@ -1203,7 +1304,9 @@ def extract_codex(cache_con: sqlite3.Connection, pool: ProcessPoolExecutor | Non
                     l_reas,
                     l_tot,
                     is_comp_base,
-                ) = ev
+                ) = ev[:15]
+                ev_ts = ev[15] if len(ev) > 15 else ""
+                ev_effort = (ev[16] if len(ev) > 16 else "") or str(_effort or "")
                 cum6 = (c_in, c_cr, c_cw, c_out, c_reas, c_tot)
 
                 # Skip inherited parent prefix turns or compaction header baseline records
@@ -1236,13 +1339,14 @@ def extract_codex(cache_con: sqlite3.Connection, pool: ProcessPoolExecutor | Non
                 if turn_sum <= 0:
                     continue
 
-                eff_date = d_str if d_str != "unknown" else fallback_date
+                eff_key = d_str if d_str != "unknown" else fallback_date
+                eff_date = hour_key_date(eff_key)
                 if eff_date != "unknown":
                     min_date = min(min_date, eff_date)
                     max_date = max(max_date, eff_date)
 
                 model_id, provider = normalize_model_and_provider(m_turn or db_model, model_provider, "Codex")
-                key = (eff_date, "Codex", provider, model_id, proj, actor, 0)
+                key = (eff_key, "Codex", provider, model_id, proj, actor, 0)
                 b = cube_acc[key]
                 b[0] += 1
                 b[1] += uncached_in
@@ -1250,6 +1354,9 @@ def extract_codex(cache_con: sqlite3.Connection, pool: ProcessPoolExecutor | Non
                 b[3] += d_cw
                 b[4] += out_txt
                 b[5] += d_reas
+                tl = timelines[tid]
+                tl["parent"] = tl_parent
+                tl["calls"].append([to_epoch_ms(ev_ts), model_id, uncached_in, d_cr, d_cw, out_txt, d_reas, 0.0, ev_effort])
 
                 mp = (model_id, provider)
                 mp_toks[mp] += turn_sum
@@ -1448,6 +1555,7 @@ def extract_codex(cache_con: sqlite3.Connection, pool: ProcessPoolExecutor | Non
     return {
         "cube": cube_acc,
         "sessions": sessions_out,
+        "timelines": timelines,
         "project_paths": project_raw_paths,
         "codex_wallet": codex_wallet,
         "health": {
@@ -1499,7 +1607,8 @@ def extract_opencode(cache_con: sqlite3.Connection) -> dict[str, Any]:
             cw INTEGER NOT NULL,
             out_txt INTEGER NOT NULL,
             reas INTEGER NOT NULL,
-            cost REAL NOT NULL
+            cost REAL NOT NULL,
+            ts_ms INTEGER NOT NULL DEFAULT 0
         );
         CREATE INDEX IF NOT EXISTS opencode_msg_cache_sess_idx ON opencode_msg_cache(session_id);
         """
@@ -1624,7 +1733,7 @@ def extract_opencode(cache_con: sqlite3.Connection) -> dict[str, Any]:
                     (
                         mid,
                         sid,
-                        epoch_to_local_date(t_created),
+                        epoch_to_local_hour_key(t_created),
                         str(o.get("modelID") or ""),
                         str(o.get("providerID") or ""),
                         inp,
@@ -1633,6 +1742,7 @@ def extract_opencode(cache_con: sqlite3.Connection) -> dict[str, Any]:
                         out_txt,
                         reas,
                         c_usd,
+                        to_epoch_ms(t_created),
                     )
                 )
 
@@ -1668,7 +1778,7 @@ def extract_opencode(cache_con: sqlite3.Connection) -> dict[str, Any]:
                     (
                         mid,
                         sid,
-                        epoch_to_local_date(t_created),
+                        epoch_to_local_hour_key(t_created),
                         str(m_id or ""),
                         str(p_id or ""),
                         inp_i,
@@ -1677,6 +1787,7 @@ def extract_opencode(cache_con: sqlite3.Connection) -> dict[str, Any]:
                         out_i,
                         reas_i,
                         cost_f,
+                        to_epoch_ms(t_created),
                     )
                 )
 
@@ -1684,8 +1795,8 @@ def extract_opencode(cache_con: sqlite3.Connection) -> dict[str, Any]:
             cache_con.executemany(
                 """
                 INSERT OR REPLACE INTO opencode_msg_cache
-                (msg_id, session_id, date_str, model_id, provider_id, inp, cr, cw, out_txt, reas, cost)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                (msg_id, session_id, date_str, model_id, provider_id, inp, cr, cw, out_txt, reas, cost, ts_ms)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 msg_inserts,
             )
@@ -1706,8 +1817,9 @@ def extract_opencode(cache_con: sqlite3.Connection) -> dict[str, Any]:
     min_date, max_date = "9999-99-99", "0000-00-00"
     total_msgs = 0
 
-    for sid, d_str, m_id, p_id, inp, cr, cw, out_txt, reas, cost in cache_con.execute(
-        "SELECT session_id, date_str, model_id, provider_id, inp, cr, cw, out_txt, reas, cost FROM opencode_msg_cache"
+    timelines = new_timelines()
+    for sid, d_str, m_id, p_id, inp, cr, cw, out_txt, reas, cost, ts_ms in cache_con.execute(
+        "SELECT session_id, date_str, model_id, provider_id, inp, cr, cw, out_txt, reas, cost, ts_ms FROM opencode_msg_cache"
     ):
         meta = sess_meta.get(sid)
         if meta is None:
@@ -1717,13 +1829,17 @@ def extract_opencode(cache_con: sqlite3.Connection) -> dict[str, Any]:
         eff_m = m_id or meta["m_id"]
         eff_p = p_id or meta["p_id"]
         model, provider = normalize_model_and_provider(eff_m, eff_p, "OpenCode")
-        eff_date = d_str if d_str != "unknown" else meta["date"]
+        eff_key = d_str if d_str != "unknown" else meta["date"]
+        eff_date = hour_key_date(eff_key)
 
         if eff_date != "unknown":
             min_date = min(min_date, eff_date)
             max_date = max(max_date, eff_date)
 
-        key = (eff_date, "OpenCode", provider, model, proj, actor, 0)
+        key = (eff_key, "OpenCode", provider, model, proj, actor, 0)
+        tl = timelines[sid]
+        tl["parent"] = meta.get("parent_id") or ""
+        tl["calls"].append([int(ts_ms or 0), model, inp, cr, cw, out_txt, reas, float(cost or 0.0), ""])
         b = cube_acc[key]
         b[0] += 1
         b[1] += inp
@@ -1831,7 +1947,8 @@ def extract_opencode(cache_con: sqlite3.Connection) -> dict[str, Any]:
     non_promo_logged_usd = 0.0
     promo_min_date, promo_max_date = "9999-99-99", "0000-00-00"
     paid_min_date, paid_max_date = "9999-99-99", "0000-00-00"
-    for (_d, _h, prov_oc, _m, _p, _a, _arch), vals_oc in cube_acc.items():
+    for (_dk, _h, prov_oc, _m, _p, _a, _arch), vals_oc in cube_acc.items():
+        _d = hour_key_date(_dk)
         c_val = float(vals_oc[6] or 0.0)
         if c_val <= 0:
             continue
@@ -1851,6 +1968,7 @@ def extract_opencode(cache_con: sqlite3.Connection) -> dict[str, Any]:
     return {
         "cube": cube_acc,
         "sessions": sessions_out,
+        "timelines": timelines,
         "project_paths": project_raw_paths,
         "opencode_billing": {
             "promo_providers": sorted(promo_provs),
@@ -2285,6 +2403,7 @@ def extract_antigravity(cache_con: sqlite3.Connection, pool: ProcessPoolExecutor
     )
     sessions_out: list[dict[str, Any]] = []
     project_raw_paths: dict[str, set[str]] = defaultdict(set)
+    timelines = new_timelines()
     total_steps = 0
     min_date, max_date = "9999-99-99", "0000-00-00"
 
@@ -2305,14 +2424,18 @@ def extract_antigravity(cache_con: sqlite3.Connection, pool: ProcessPoolExecutor
 
         for rec in payload.get("gens") or []:
             ts_val, raw_m, inp, cr, cw, out_txt, reas = rec
-            d_str = epoch_to_local_date(ts_val) if is_db else iso_to_local_date(str(ts_val))
-            eff_date = d_str if d_str != "unknown" else fallback_date
+            d_key = epoch_to_local_hour_key(ts_val) if is_db else iso_to_local_hour_key(str(ts_val))
+            eff_key = d_key if d_key != "unknown" else fallback_date
+            eff_date = hour_key_date(eff_key)
             if eff_date != "unknown":
                 min_date = min(min_date, eff_date)
                 max_date = max(max_date, eff_date)
 
             model, provider = normalize_model_and_provider(raw_m, None, "Antigravity")
-            key = (eff_date, "Antigravity", provider, model, proj, actor, 0)
+            key = (eff_key, "Antigravity", provider, model, proj, actor, 0)
+            tl = timelines[cid]
+            tl["parent"] = meta.get("parent_cid") or payload.get("parent_cid") or ""
+            tl["calls"].append([to_epoch_ms(ts_val), model, inp, cr, cw, out_txt, reas, 0.0, ""])
             b = cube_acc[key]
             b[0] += 1
             b[1] += inp
@@ -2367,6 +2490,7 @@ def extract_antigravity(cache_con: sqlite3.Connection, pool: ProcessPoolExecutor
     return {
         "cube": cube_acc,
         "sessions": sessions_out,
+        "timelines": timelines,
         "project_paths": project_raw_paths,
         "health": {
             "harness": "Antigravity",
@@ -2815,6 +2939,150 @@ def build_billing_summary(
     }
 
 
+def _session_detail_id(harness: str, root_id: str) -> str:
+    return hashlib.sha1(f"{harness}\x00{root_id}".encode("utf-8")).hexdigest()[:16]
+
+
+def build_session_details(
+    results: list[dict[str, Any]],
+    all_sessions: list[dict[str, Any]],
+    default_rates: dict[str, Any],
+) -> dict[str, Any]:
+    """
+    Group every session with its subagent / forked / auto-review descendants and write one
+    `web/sessions/<id>.js` per group (a per-call timeline the session page loads via <script>, so
+    it also works over file://). Sessions get a `detail` id pointing at their group's file.
+    Unchanged groups are not rewritten; files for groups that disappeared are removed.
+    """
+    sess_by_key: dict[tuple[str, str], dict[str, Any]] = {(s["harness"], s["id"]): s for s in all_sessions}
+    groups: dict[tuple[str, str], list[str]] = defaultdict(list)
+    tl_by_key: dict[tuple[str, str], dict[str, Any]] = {}
+
+    for res in results:
+        tls = res.get("timelines") or {}
+        harness = (res.get("health") or {}).get("harness") or ""
+        known = set(tls.keys())
+
+        def root_of(sid: str) -> str:
+            seen = {sid}
+            cur = sid
+            while True:
+                par = (tls.get(cur) or {}).get("parent") or ""
+                if not par or par in seen or (par not in known and (harness, par) not in sess_by_key):
+                    return cur
+                seen.add(par)
+                cur = par
+
+        for sid, tl in tls.items():
+            if not tl.get("calls"):
+                continue
+            tl_by_key[(harness, sid)] = tl
+            groups[(harness, root_of(sid))].append(sid)
+
+    SESSION_DETAIL_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        manifest = json.loads(SESSION_DETAIL_MANIFEST_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        manifest = {}
+    new_manifest: dict[str, str] = {}
+    written = 0
+    total_calls = 0
+
+    for (harness, root), members in sorted(groups.items()):
+        detail_id = _session_detail_id(harness, root)
+        calls_all: list[tuple[int, int, list[Any]]] = []
+        agent_first: dict[str, int] = {}
+        untimed = 0
+        for sid in members:
+            for c in tl_by_key[(harness, sid)]["calls"]:
+                if c[0] > 0:
+                    calls_all.append((c[0], 0, [sid, *c]))
+                    agent_first[sid] = min(agent_first.get(sid, c[0]), c[0])
+                else:
+                    untimed += 1
+        if not calls_all:
+            continue
+        # Root first, then descendants in order of their first call
+        order = sorted(members, key=lambda m: (m != root, agent_first.get(m, 1 << 62), m))
+        order = [m for m in order if m in agent_first]
+        agent_idx = {sid: i for i, sid in enumerate(order)}
+        calls_all.sort(key=lambda t: (t[0], agent_idx[t[2][0]]))
+        t0 = calls_all[0][0]
+        models: list[str] = []
+        model_idx: dict[str, int] = {}
+        efforts: list[str] = []
+        effort_idx: dict[str, int] = {}
+        rows = []
+        for ms, _o, (sid, _ms, model, inp, cr, cw, out_txt, reas, cost, *rest) in calls_all:
+            effort = str(rest[0]) if rest else ""
+            if model not in model_idx:
+                model_idx[model] = len(models)
+                models.append(model)
+            if effort not in effort_idx:
+                effort_idx[effort] = len(efforts)
+                efforts.append(effort)
+            rows.append(
+                [ms - t0, agent_idx[sid], model_idx[model], inp, cr, cw, out_txt, reas, round(float(cost), 6), effort_idx[effort]]
+            )
+        total_calls += len(rows)
+
+        agents = []
+        for sid in order:
+            s = sess_by_key.get((harness, sid)) or {}
+            tl = tl_by_key[(harness, sid)]
+            agents.append(
+                {
+                    "id": sid,
+                    "parent": tl.get("parent") or "",
+                    "title": s.get("title") or sid,
+                    "actor": s.get("actor") or ("main" if sid == root else "subagent"),
+                    "model": s.get("model") or "",
+                    "project": s.get("project") or "",
+                }
+            )
+        root_s = sess_by_key.get((harness, root)) or {}
+        detail = {
+            "id": detail_id,
+            "harness": harness,
+            "root": root,
+            "title": root_s.get("title") or root,
+            "project": root_s.get("project") or (agents[0]["project"] if agents else ""),
+            "t0": t0,
+            "untimed_calls": untimed,
+            "models": models,
+            "efforts": efforts,
+            "rates": {m: default_rates.get(m) for m in models if default_rates.get(m)},
+            "agents": agents,
+            "call_columns": [
+                "dt_ms", "agent", "model", "input_uncached", "cache_read", "cache_write",
+                "output_text", "reasoning", "logged_cost_usd", "effort",
+            ],
+            "calls": rows,
+        }
+        body = json.dumps(detail, separators=(",", ":"))
+        digest = hashlib.sha1(body.encode("utf-8")).hexdigest()
+        new_manifest[detail_id] = digest
+        out_path = SESSION_DETAIL_DIR / f"{detail_id}.js"
+        if manifest.get(detail_id) != digest or not out_path.exists():
+            _atomic_write_text(out_path, f"window.__TOKEN_SESSION__ = {body};\n")
+            written += 1
+        for sid in members:
+            s = sess_by_key.get((harness, sid))
+            if s is not None:
+                s["detail"] = detail_id
+
+    removed = 0
+    for f in SESSION_DETAIL_DIR.glob("*.js"):
+        if f.stem not in new_manifest:
+            try:
+                f.unlink()
+                removed += 1
+            except OSError:
+                pass
+    _atomic_write_text(SESSION_DETAIL_MANIFEST_PATH, json.dumps(new_manifest, separators=(",", ":")))
+    return {"groups": len(new_manifest), "written": written, "removed": removed, "calls": total_calls}
+
+
 def extract_all(rebuild: bool = False) -> dict[str, Any]:
     with EXTRACT_LOCK:
         return _extract_all_locked(rebuild=rebuild)
@@ -2853,11 +3121,22 @@ def _extract_all_locked(rebuild: bool = False) -> dict[str, Any]:
     merged_proj_paths: dict[str, set[str]] = defaultdict(set)
     health_list: list[dict[str, Any]] = []
 
+    # Extractors key cube cells by a local "YYYY-MM-DDTHH" bucket (or a bare date when the hour is
+    # unknown). Roll those up into the daily cube and keep a parallel per-hour breakdown of each cell.
+    hourly_acc: dict[tuple[tuple[str, str, str, str, str, str, int], int], list[float]] = defaultdict(
+        lambda: [0, 0, 0, 0, 0, 0, 0.0]
+    )
     for res in (claude_res, codex_res, oc_res, ag_res):
         for k, vals in res["cube"].items():
-            b = merged_cube[k]
+            date_s, hour = split_hour_key(k[0])
+            day_k = (date_s, *k[1:])
+            b = merged_cube[day_k]
             for i in range(7):
                 b[i] += vals[i]
+            if hour >= 0:
+                hb = hourly_acc[(day_k, hour)]
+                for i in range(7):
+                    hb[i] += vals[i]
         all_sessions.extend(res["sessions"])
         for proj, paths in res["project_paths"].items():
             merged_proj_paths[proj].update(paths)
@@ -2870,6 +3149,7 @@ def _extract_all_locked(rebuild: bool = False) -> dict[str, Any]:
         sess_counts_by_cell[ck] += 1
 
     cube_rows = []
+    cube_row_index: dict[tuple[str, str, str, str, str, str, int], int] = {}
     distinct_models: dict[str, str] = {}
     for k in sorted(merged_cube.keys()):
         date_s, harness, provider, model, project, actor, archived = k
@@ -2877,6 +3157,7 @@ def _extract_all_locked(rebuild: bool = False) -> dict[str, Any]:
         if (inp + cr + cw + out_txt + reas) == 0 and cost == 0:
             continue
         distinct_models[model] = provider
+        cube_row_index[k] = len(cube_rows)
         cube_rows.append(
             [
                 date_s,
@@ -2897,6 +3178,19 @@ def _extract_all_locked(rebuild: bool = False) -> dict[str, Any]:
             ]
         )
 
+    # Compact hourly breakdown: each row points back at its daily cube row (dimensions live there)
+    cube_hourly_rows = []
+    for (day_k, hour) in sorted(hourly_acc.keys(), key=lambda hk: (cube_row_index.get(hk[0], -1), hk[1])):
+        row_idx = cube_row_index.get(day_k)
+        if row_idx is None:
+            continue
+        calls, inp, cr, cw, out_txt, reas, cost = hourly_acc[(day_k, hour)]
+        if (inp + cr + cw + out_txt + reas) == 0 and cost == 0:
+            continue
+        cube_hourly_rows.append(
+            [row_idx, hour, int(calls), int(inp), int(cr), int(cw), int(out_txt), int(reas), round(float(cost), 6)]
+        )
+
     # Align active_tokens with frontend (fresh prompt input + cache write + output + reasoning)
     for s in all_sessions:
         s["total_tokens"] = (
@@ -2913,12 +3207,16 @@ def _extract_all_locked(rebuild: bool = False) -> dict[str, Any]:
         m: default_model_pricing(m, prov) for m, prov in sorted(distinct_models.items())
     }
     billing_summary = build_billing_summary(claude_res, codex_res, oc_res, cube_rows, default_rates)
+    session_detail_stats = build_session_details(
+        [claude_res, codex_res, oc_res, ag_res], all_sessions, default_rates
+    )
 
     total_ms = round((time.time() - t_start) * 1000, 1)
     payload = {
         "generated_at": dt.datetime.now().astimezone().isoformat(timespec="seconds"),
         "hostname": os.uname().nodename,
         "extraction_ms": total_ms,
+        "session_details": session_detail_stats,
         "total_sessions_indexed": len(all_sessions),
         "cube_columns": [
             "date",
@@ -2938,6 +3236,18 @@ def _extract_all_locked(rebuild: bool = False) -> dict[str, Any]:
             "logged_cost_usd",
         ],
         "cube": cube_rows,
+        "cube_hourly_columns": [
+            "cube_row",
+            "hour",
+            "calls",
+            "input_uncached",
+            "cache_read",
+            "cache_write",
+            "output_text",
+            "reasoning",
+            "logged_cost_usd",
+        ],
+        "cube_hourly": cube_hourly_rows,
         "top_sessions": ranked_sessions,
         "default_rates_per_1m": default_rates,
         "billing": billing_summary,

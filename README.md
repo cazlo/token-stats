@@ -59,3 +59,25 @@ Different providers report token fields differently (e.g., Codex `input_tokens` 
 3. `cache_read` — Reused cached prompt tokens
 4. `output_text` — Visible non-reasoning completion tokens
 5. `reasoning` — Thinking / reasoning completion tokens
+
+## Time Views
+
+- **Token Velocity Over Time** stacks the top 10 series (harness, provider, project, model, token type or role) plus an `Other` bucket, at **Hourly**, **Daily** or **Weekly** grain. Hourly buckets use local time and show up to the latest 31 days of the selected range; pre-cleanup Claude history (`stats-cache.json`) has no hour-level timestamps and is left out of hourly views. Hover a legend item to spotlight that series on the baseline; click it to filter.
+- **Daily Activity Calendar** is a GitHub-style day grid shaded by quartile of the active Primary Metric, with active-day and streak stats. Click a day to isolate it.
+- **Hour-of-Day Cadence** sits next to the day-of-week profile.
+- **Range selection:** the Range bar has `1d`, `3d`, `7d`, `14d`, `30d` and month presets (counted back from the latest day with data). On the velocity chart and the calendar, click a bar/day to select it, or press and drag across bars/days to select a span; everything on the page filters to that range. In the hourly view a drag selects exact hours (e.g. `2026-10-29 15:00 → 2026-10-30 10:59`), shown as a ⏱ pill next to the date pickers; its ✕ widens back to whole days, and clicking an hourly bar opens its whole day. Session counts stay day-level, since sessions only carry a date.
+
+The payload carries a compact `cube_hourly` table alongside the daily `cube`: each row is `[cube_row, hour, calls, input_uncached, cache_read, cache_write, output_text, reasoning, logged_cost_usd]`, where `cube_row` indexes the daily row that holds its dimensions.
+
+## Session Timelines
+
+Every session in **Heavyweight Sessions & Subagent Runs** links to `session.html`, a call-by-call view of that session together with its subagents (and Codex forks / auto-reviews):
+
+- **Token Burn Over Time** — stacked by agent, token type, model or reasoning effort, per interval or cumulative.
+- **Agent Lanes** — when the main session and each subagent were active, with dashed connectors where a subagent was spawned.
+- **Context Size per Call** — prompt size on every call per agent, with ▼ marking sharp drops (usually compactions).
+- **Agents** table — calls, tokens, est. $, peak context and drops per agent for the visible window.
+
+Reasoning effort is shown per call, per agent and for the whole session where the harness logs it: Claude Code (`perTurnEffort` / `effort` on each assistant entry) and Codex (`turn_context` effort, falling back to the thread's `reasoning_effort`). OpenCode and Antigravity show it as *not logged*.
+
+Drag across any chart to zoom all of them to a time window; click a lane, legend entry or table row to focus one agent. Each session group is written to git-ignored `web/sessions/<id>.js` during extraction (unchanged files are not rewritten), so the page also works offline via `file://`.

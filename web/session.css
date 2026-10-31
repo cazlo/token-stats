@@ -1,0 +1,127 @@
+/* Session timeline page (session.html) — builds on styles.css */
+
+.btn-link {
+  display: inline-flex;
+  align-items: center;
+  padding: 7px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-card);
+  color: var(--text);
+  text-decoration: none;
+  font-size: 13px;
+}
+
+.btn-link:hover {
+  border-color: var(--border-strong);
+  background: var(--bg-hover);
+}
+
+.sess-error {
+  color: var(--text-muted);
+  text-align: center;
+  padding: 40px 20px;
+}
+
+.sess-error[hidden],
+#sess-body[hidden] {
+  display: none;
+}
+
+.sess-title {
+  margin: 0 0 8px;
+  font-size: 17px;
+  line-height: 1.35;
+}
+
+.sess-meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 14px;
+  font-size: 12.5px;
+  color: var(--text-muted);
+}
+
+.sess-meta strong {
+  color: var(--text);
+}
+
+.window-label {
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+#btn-reset-zoom[hidden],
+.focus-chip[hidden] {
+  display: none;
+}
+
+.focus-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 4px 3px 9px;
+  border: 1px solid var(--accent);
+  border-radius: 99px;
+  background: var(--accent-soft);
+  font-size: 12px;
+  max-width: 420px;
+}
+
+.focus-chip .focus-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.focus-chip button {
+  padding: 1px 6px;
+  font-size: 11px;
+  border-radius: 99px;
+}
+
+.lanes-wrap {
+  position: relative;
+  width: 100%;
+  max-height: 560px;
+  overflow-y: auto;
+  user-select: none;
+}
+
+#lanes-svg {
+  height: auto;
+}
+
+.chart-svg .lane-row {
+  cursor: pointer;
+}
+
+.chart-svg .lane-row:hover .lane-bg {
+  fill: var(--bg-hover);
+}
+
+.chart-svg.agent-focus .agent-mark {
+  opacity: 0.14;
+}
+
+.chart-svg.agent-focus .agent-mark.is-focus {
+  opacity: 1;
+}
+
+.chart-svg .agent-mark {
+  transition: opacity 0.12s ease;
+}
+
+.agent-cell {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  max-width: 290px;
+}
+
+.agent-cell span:last-child {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}

@@ -1,0 +1,119 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Session Timeline · Token Observatory</title>
+  <link rel="stylesheet" href="./styles.css" />
+  <link rel="stylesheet" href="./session.css" />
+</head>
+<body>
+  <div class="app-shell">
+    <header class="top-header">
+      <div class="brand-group">
+        <div class="brand-mark">Σ</div>
+        <div>
+          <h1 class="brand-title">Session Timeline</h1>
+          <p class="brand-sub" id="sess-subtitle">Loading session…</p>
+        </div>
+      </div>
+      <div class="header-actions">
+        <a class="btn-link" href="./index.html" title="Back to the observatory dashboard">← Observatory</a>
+        <button id="btn-theme" title="Toggle Dark / Light theme">◐ Theme</button>
+      </div>
+    </header>
+
+    <div id="sess-error" class="panel sess-error" hidden></div>
+
+    <div id="sess-body" hidden>
+      <section class="panel">
+        <div class="sess-head">
+          <div>
+            <h2 class="sess-title" id="sess-title"></h2>
+            <div class="sess-meta" id="sess-meta"></div>
+          </div>
+        </div>
+      </section>
+
+      <section class="control-bar">
+        <div class="control-group">
+          <span class="control-label">Metric</span>
+          <select id="metric-select">
+            <option value="total">Total Tokens (incl. Cache Read)</option>
+            <option value="active">Fresh / Active Tokens (excl. Cache Read)</option>
+            <option value="generated">Generated Only (Output + Reasoning)</option>
+            <option value="est_cost">Est. API-Equivalent Value ($)</option>
+          </select>
+        </div>
+        <div class="control-group" id="window-controls">
+          <span class="control-label">Window</span>
+          <span class="mono window-label" id="window-label"></span>
+          <button id="btn-reset-zoom" hidden>Reset zoom</button>
+          <span class="focus-chip" id="focus-chip" hidden></span>
+        </div>
+      </section>
+
+      <section class="kpi-grid" id="kpi-grid"></section>
+
+      <section class="panel">
+        <div class="panel-header">
+          <div>
+            <h2 class="panel-title">Token Burn Over Time</h2>
+            <p class="panel-subtitle" id="burn-subtitle">Drag across the chart to zoom into a time window · Hover a legend item to highlight it</p>
+          </div>
+          <div class="control-group">
+            <span class="control-label">Stack By</span>
+            <div class="seg-group" id="stack-group">
+              <button class="seg-btn active" data-stack="agent">Agent</button>
+              <button class="seg-btn" data-stack="bucket">Token Type</button>
+              <button class="seg-btn" data-stack="model">Model</button>
+              <button class="seg-btn" data-stack="effort">Effort</button>
+            </div>
+            <div class="seg-group" id="mode-group">
+              <button class="seg-btn active" data-mode="interval">Per Interval</button>
+              <button class="seg-btn" data-mode="cumulative">Cumulative</button>
+            </div>
+          </div>
+        </div>
+        <div class="chart-wrap" id="burn-wrap"><svg class="chart-svg" id="burn-svg"></svg></div>
+        <div class="chart-legend" id="burn-legend"></div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-header">
+          <div>
+            <h2 class="panel-title">Agent Lanes</h2>
+            <p class="panel-subtitle">When the main session and each subagent were active · dashed lines mark where a subagent was spawned · Click a lane to focus that agent</p>
+          </div>
+        </div>
+        <div class="lanes-wrap" id="lanes-wrap"><svg class="chart-svg" id="lanes-svg"></svg></div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-header">
+          <div>
+            <h2 class="panel-title">Context Size per Call</h2>
+            <p class="panel-subtitle">Prompt tokens sent on each call (uncached + cache read + cache write) · ▼ marks a sharp drop, usually a compaction</p>
+          </div>
+        </div>
+        <div class="chart-wrap" id="ctx-wrap"><svg class="chart-svg" id="ctx-svg"></svg></div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-header">
+          <div>
+            <h2 class="panel-title">Agents</h2>
+            <p class="panel-subtitle">Totals for the visible time window · Click a row to focus that agent</p>
+          </div>
+        </div>
+        <div class="table-wrap" id="agents-table-wrap"></div>
+      </section>
+    </div>
+  </div>
+
+  <div class="chart-tooltip" id="chart-tooltip" hidden></div>
+
+  <script src="./common.js"></script>
+  <script src="./session.js"></script>
+</body>
+</html>

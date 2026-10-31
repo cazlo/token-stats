@@ -43,6 +43,8 @@
         <span class="control-label">Range</span>
         <div class="seg-group" id="range-presets">
           <button class="seg-btn active" data-range="all">All Time</button>
+          <button class="seg-btn" data-range="1d">1d</button>
+          <button class="seg-btn" data-range="3d">3d</button>
           <button class="seg-btn" data-range="7d">7d</button>
           <button class="seg-btn" data-range="14d">14d</button>
           <button class="seg-btn" data-range="30d">30d</button>
@@ -51,6 +53,10 @@
         <input type="date" id="date-from" aria-label="Start date" />
         <span style="color: var(--text-dim)">→</span>
         <input type="date" id="date-to" aria-label="End date" />
+        <span class="hour-window" id="hour-window" hidden title="Hour-level range: the first and last days are cut to these local times">
+          ⏱ <span data-hour-label></span>
+          <button id="btn-clear-hours" title="Widen to whole days">✕</button>
+        </span>
       </div>
 
       <div class="control-group">
@@ -104,7 +110,7 @@
       <div class="panel-header">
         <div>
           <h2 class="panel-title">Token Velocity Over Time</h2>
-          <p class="panel-subtitle" id="timeline-subtitle">Click any legend item to filter, or click a bar to isolate a date/week</p>
+          <p class="panel-subtitle" id="timeline-subtitle">Hover a legend item to highlight it, click to filter · Click a bar to isolate a date/week</p>
         </div>
         <div class="control-group">
           <span class="control-label">Stack By</span>
@@ -117,6 +123,7 @@
             <button class="seg-btn" data-stack="actor">Role</button>
           </div>
           <div class="seg-group" id="chart-grain-group">
+            <button class="seg-btn" data-grain="hour">Hourly</button>
             <button class="seg-btn active" data-grain="day">Daily</button>
             <button class="seg-btn" data-grain="week">Weekly</button>
           </div>
@@ -127,6 +134,18 @@
         <svg class="chart-svg" id="timeline-svg"></svg>
       </div>
       <div class="chart-legend" id="timeline-legend"></div>
+    </section>
+
+    <!-- GitHub-style Daily Activity Calendar -->
+    <section class="panel">
+      <div class="panel-header">
+        <div>
+          <h2 class="panel-title">Daily Activity Calendar</h2>
+          <p class="panel-subtitle">One cell per day, shaded by quartile of the active Primary Metric · Click a day, or drag across days, to select a range</p>
+        </div>
+      </div>
+      <div class="calendar-wrap" id="calendar-wrap"></div>
+      <div class="calendar-stats" id="calendar-stats"></div>
     </section>
 
     <!-- Token Anatomy + Subagent Swarm Split -->
@@ -145,12 +164,13 @@
       <section class="panel">
         <div class="panel-header">
           <div>
-            <h2 class="panel-title">Execution Role &amp; Day-of-Week Cadence</h2>
+            <h2 class="panel-title">Execution Role, Day-of-Week &amp; Hour-of-Day Cadence</h2>
             <p class="panel-subtitle">Click a role (`subagent`, `main`, `auto_review`) to cross-filter everything</p>
           </div>
         </div>
         <div class="role-rows" id="actor-rows"></div>
         <div class="dow-grid" id="dow-grid"></div>
+        <div class="hod-grid" id="hod-grid"></div>
       </section>
     </div>
 
@@ -229,7 +249,7 @@
       <div class="panel-header">
         <div>
           <h2 class="panel-title">Heavyweight Sessions &amp; Subagent Runs</h2>
-          <p class="panel-subtitle" id="sessions-subtitle">Top individual threads &amp; runs matching active filters</p>
+          <p class="panel-subtitle" id="sessions-subtitle">Top individual threads &amp; runs matching active filters · Open a session's timeline to see its calls and subagents over time</p>
         </div>
         <div class="control-group">
           <input type="search" id="session-search" placeholder="Search session title, project, model…" />
@@ -312,6 +332,7 @@
     </div>
   </div>
 
+  <script src="./common.js"></script>
   <script src="./data.js"></script>
   <script src="./app.js"></script>
 </body>
