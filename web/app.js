@@ -1,40 +1,93 @@
 (() => {
   "use strict";
 
-  const PALETTE = {
-    harness: {
-      "Claude Code": "#e88b5a",
-      "Codex": "#4ade80",
-      "OpenCode": "#60a5fa",
-      "Antigravity": "#c084fc",
+  // Theme-aware palettes. Harness / provider hues follow vendor branding (Claude = clay orange,
+  // OpenAI / Codex = blue, Google / Antigravity = green) and were checked for normal-vision and
+  // colour-blind (protan/deutan) separation against each theme's card surface.
+  // `series` is the categorical set for open-ended dimensions (projects, models): 10 hues that are
+  // mutually distinct across ALL pairs (not only neighbours), assigned per entity so no two series
+  // visible in the same chart ever share a colour. "Other" is always the neutral slate.
+  const PALETTES = {
+    dark: {
+      harness: {
+        "Claude Code": "#e07a55",
+        "Codex": "#5a95f5",
+        "OpenCode": "#c94fa8",
+        "Antigravity": "#86e3a5",
+      },
+      provider: {
+        "Anthropic": "#e07a55",
+        "OpenAI": "#5a95f5",
+        "Google": "#86e3a5",
+        "Local / Self-Hosted GPU": "#c94fa8",
+        "Other": "#94a3b8",
+      },
+      actor: {
+        "subagent": "#a78bfa",
+        "main": "#38bdf8",
+        "auto_review": "#fbbf24",
+      },
+      bucket: {
+        "Cache Read": "#475569",
+        "Cache Write": "#f59e0b",
+        "Uncached Input": "#38bdf8",
+        "Text Output": "#34d399",
+        "Reasoning": "#f472b6",
+        "Subscriptions": "#38bdf8",
+        "Overages / Credits": "#f59e0b",
+      },
+      series: [
+        "#60d0fe", "#fb4c10", "#92e62c", "#9563fe", "#c5ad4c",
+        "#d57ba0", "#36d4a6", "#759ae6", "#c33dbd", "#009c1e",
+      ],
+      other: "#64748b",
+      // GitHub-style activity ramp: empty cell + 4 intensity steps (one hue, dim -> bright)
+      heat: ["#1a2131", "#173f73", "#1f62b3", "#3987e5", "#9ec5f4"],
     },
-    provider: {
-      "Anthropic": "#e88b5a",
-      "OpenAI": "#34d399",
-      "Google": "#a78bfa",
-      "Local / Self-Hosted GPU": "#fbbf24",
-      "Other": "#94a3b8",
+    light: {
+      harness: {
+        "Claude Code": "#e0784a",
+        "Codex": "#2563eb",
+        "OpenCode": "#b8389a",
+        "Antigravity": "#0f6b2f",
+      },
+      provider: {
+        "Anthropic": "#e0784a",
+        "OpenAI": "#2563eb",
+        "Google": "#0f6b2f",
+        "Local / Self-Hosted GPU": "#b8389a",
+        "Other": "#64748b",
+      },
+      actor: {
+        "subagent": "#7c3aed",
+        "main": "#0284c7",
+        "auto_review": "#c98500",
+      },
+      bucket: {
+        "Cache Read": "#94a3b8",
+        "Cache Write": "#d97706",
+        "Uncached Input": "#0284c7",
+        "Text Output": "#059669",
+        "Reasoning": "#db2777",
+        "Subscriptions": "#0284c7",
+        "Overages / Credits": "#d97706",
+      },
+      series: [
+        "#0d76ad", "#cd7d09", "#5ccc22", "#9754ed", "#b24358",
+        "#026812", "#ef74fb", "#3f34cb", "#fb5b7b", "#851690",
+      ],
+      other: "#94a3b8",
+      heat: ["#eef2f8", "#b7d3f6", "#6da7ec", "#2a78d6", "#104281"],
     },
-    actor: {
-      "subagent": "#a78bfa",
-      "main": "#38bdf8",
-      "auto_review": "#fbbf24",
-    },
-    bucket: {
-      "Cache Read": "#475569",
-      "Cache Write": "#f59e0b",
-      "Uncached Input": "#38bdf8",
-      "Text Output": "#34d399",
-      "Reasoning": "#f472b6",
-      "Subscriptions": "#38bdf8",
-      "Overages / Credits": "#f59e0b",
-    },
-    series: [
-      "#38bdf8", "#e88b5a", "#4ade80", "#c084fc",
-      "#fbbf24", "#f472b6", "#2dd4bf", "#818cf8",
-      "#fb7185", "#a3e635", "#60a5fa", "#f97316",
-    ],
   };
+  let PALETTE = PALETTES.dark;
+
+  function applyThemePalette(theme) {
+    PALETTE = theme === "light" ? PALETTES.light : PALETTES.dark;
+  }
+
+  // Number of named series in stacked charts before the remainder folds into "Other"
+  const TOP_SERIES = 10;
 
   const ACTOR_LABELS = {
     subagent: "Subagent Swarm",
@@ -60,6 +113,7 @@
   const C_OUT = 12;
   const C_REAS = 13;
   const C_COST = 14;
+  const C_HOUR = 15; // only present on hourly rows built from rawData.cube_hourly
 
   const STORAGE_RATES_KEY = "token_obs_rates_v1";
   const STORAGE_BILLING_KEY = "token_obs_billing_v1";
@@ -78,7 +132,7 @@
     includeArchived: true,
     showPaths: false,
     chartStack: "harness", // harness | provider | project | model | bucket | actor
-    chartGrain: "day", // day | week
+    chartGrain: "day", // hour | day | week
     matrixMode: "project_harness",
     modelSearch: "",
     sessionSearch: "",
@@ -141,14 +195,68 @@
       .replace(/"/g, "&quot;");
   }
 
-  function hashColor(key) {
-    let h = 2166136261;
-    const s = String(key || "");
-    for (let i = 0; i < s.length; i++) {
-      h ^= s.charCodeAt(i);
-      h = Math.imul(h, 16777619);
+  // Stable, collision-free colours for open-ended dimensions (project, model, ...). Each entity keeps
+  // the palette slot it was first given; if two entities visible in the same chart would share a
+  // slot, the newcomer moves to a free slot (and keeps it), so colours follow the entity, not rank.
+  const seriesSlotRegistry = new Map(); // dim -> Map(key -> slot index)
+
+  function seedSeriesSlots() {
+    seriesSlotRegistry.clear();
+    if (!rawData || !rawData.cube) return;
+    for (const [dim, col] of [["project", C_PROJECT], ["model", C_MODEL], ["harness", C_HARNESS], ["provider", C_PROVIDER], ["actor", C_ACTOR]]) {
+      const totals = new Map();
+      for (const r of rawData.cube) {
+        const k = r[col];
+        totals.set(k, (totals.get(k) || 0) + r[C_IN] + r[C_CR] + r[C_CW] + r[C_OUT] + r[C_REAS]);
+      }
+      const reg = new Map();
+      [...totals.entries()]
+        .sort((a, b) => b[1] - a[1] || String(a[0]).localeCompare(String(b[0])))
+        .forEach(([k], i) => reg.set(k, i % PALETTE.series.length));
+      seriesSlotRegistry.set(dim, reg);
     }
-    return PALETTE.series[(h >>> 0) % PALETTE.series.length];
+  }
+
+  function seriesColorMap(dim, keys) {
+    const fixed = PALETTE[dim] && dim !== "series" ? PALETTE[dim] : null;
+    const out = {};
+    const used = new Set();
+    // Pass 1: fixed brand colours, plus registry slots that are still free in this view
+    if (!seriesSlotRegistry.has(dim)) seriesSlotRegistry.set(dim, new Map());
+    const reg = seriesSlotRegistry.get(dim);
+    const pending = [];
+    for (const k of keys) {
+      if (k === "Other") {
+        out[k] = PALETTE.other;
+        continue;
+      }
+      if (fixed && fixed[k]) {
+        out[k] = fixed[k];
+        used.add(fixed[k]);
+        continue;
+      }
+      pending.push(k);
+    }
+    const unresolved = [];
+    for (const k of pending) {
+      const slot = reg.get(k);
+      const c = slot !== undefined ? PALETTE.series[slot] : null;
+      if (c && !used.has(c)) {
+        out[k] = c;
+        used.add(c);
+      } else {
+        unresolved.push(k);
+      }
+    }
+    // Pass 2: give clashing / new entities the first free slot and remember it
+    for (const k of unresolved) {
+      let slot = PALETTE.series.findIndex((c) => !used.has(c));
+      if (slot < 0) slot = (reg.get(k) || 0) % PALETTE.series.length;
+      reg.set(k, slot);
+      out[k] = PALETTE.series[slot];
+      used.add(out[k]);
+    }
+    return out;
   }
 
   function loadSavedRates() {
@@ -340,6 +448,54 @@
       if (sub > 0 || ov > 0 || promo > 0) {
         rowBillingMap.set(cube[i], { paid: sub + ov, sub, ov, promo });
       }
+    }
+    allocateHourlyBilling();
+  }
+
+  // Hourly rows: full-width cube rows (dims copied from the parent daily row) carrying one local hour
+  // of that cell's usage, plus the hour itself at C_HOUR. Paid-$ is apportioned from the parent row.
+  let hourlyRows = [];
+
+  function buildHourlyRows() {
+    hourlyRows = [];
+    const hc = rawData && rawData.cube_hourly;
+    if (!hc || !rawData.cube) return;
+    for (const h of hc) {
+      const parent = rawData.cube[h[0]];
+      if (!parent) continue;
+      const row = [
+        parent[C_DATE], parent[C_HARNESS], parent[C_PROVIDER], parent[C_MODEL], parent[C_PROJECT],
+        parent[C_ACTOR], parent[C_ARCHIVED],
+        h[2], 0, h[3], h[4], h[5], h[6], h[7], h[8],
+        h[1],
+      ];
+      row.parent = parent;
+      hourlyRows.push(row);
+    }
+  }
+
+  function onDataLoaded() {
+    buildHourlyRows();
+    seedSeriesSlots();
+  }
+
+  function allocateHourlyBilling() {
+    for (const row of hourlyRows) {
+      const pb = rowBillingMap.get(row.parent);
+      if (!pb) continue;
+      const p = row.parent;
+      const estP = calcEstCost(p[C_MODEL], p[C_IN], p[C_CR], p[C_CW], p[C_OUT], p[C_REAS]);
+      const estH = calcEstCost(row[C_MODEL], row[C_IN], row[C_CR], row[C_CW], row[C_OUT], row[C_REAS]);
+      const tokP = p[C_IN] + p[C_CR] + p[C_CW] + p[C_OUT] + p[C_REAS];
+      const tokH = row[C_IN] + row[C_CR] + row[C_CW] + row[C_OUT] + row[C_REAS];
+      const share = estP > 0 ? estH / estP : tokP > 0 ? tokH / tokP : 0;
+      const promoShare = p[C_COST] > 0 ? row[C_COST] / p[C_COST] : share;
+      rowBillingMap.set(row, {
+        paid: pb.paid * share,
+        sub: pb.sub * share,
+        ov: pb.ov * share,
+        promo: pb.promo * promoShare,
+      });
     }
   }
 
@@ -898,15 +1054,24 @@
   // SVG Stacked Timeline Chart
   // -------------------------------------------------------------------------
 
-  function colorForSeries(stackMode, key) {
-    if (stackMode === "harness" && PALETTE.harness[key]) return PALETTE.harness[key];
-    if (stackMode === "provider" && PALETTE.provider[key]) return PALETTE.provider[key];
-    if (stackMode === "actor" && PALETTE.actor[key]) return PALETTE.actor[key];
-    if (stackMode === "bucket" && PALETTE.bucket[key]) return PALETTE.bucket[key];
-    return hashColor(key);
+  function colorsForSeries(stackMode, keys) {
+    return seriesColorMap(stackMode, keys);
   }
 
-  function renderTimeline(filteredRows) {
+  // Hourly bars beyond this many days get too thin to read; show the most recent window instead
+  const HOURLY_MAX_DAYS = 31;
+
+  function addDaysISO(dateStr, days) {
+    const [y, m, d] = dateStr.split("-").map(Number);
+    const dtObj = new Date(Date.UTC(y, m - 1, d + days));
+    return dtObj.toISOString().slice(0, 10);
+  }
+
+  function dateSpanDays(minD, maxD) {
+    return Math.round((Date.parse(maxD) - Date.parse(minD)) / 86400000);
+  }
+
+  function renderTimeline(filteredRows, filteredHourly) {
     const svg = document.getElementById("timeline-svg");
     const legendEl = document.getElementById("timeline-legend");
     const wrap = document.getElementById("timeline-wrap");
@@ -916,17 +1081,41 @@
     const width = Math.max(360, wrap.clientWidth || 900);
     const height = Math.max(220, wrap.clientHeight || 290);
     svg.setAttribute("viewBox", `0 0 ${width} ${height}`);
+    svg.classList.remove("series-focus");
 
-    if (!filteredRows.length) {
-      svg.innerHTML = `<text x="${width / 2}" y="${height / 2}" text-anchor="middle" fill="var(--text-muted)">No token activity matches the current filters.</text>`;
-      legendEl.innerHTML = "";
-      return;
-    }
-
-    // Auto-upgrade to weekly grain if daily span > 366 days so long histories never truncate
+    const metric = state.metric;
     let grain = state.chartGrain;
-    let autoWeekly = false;
-    if (grain === "day") {
+    const notes = [];
+    let sourceRows = filteredRows;
+
+    if (grain === "hour") {
+      sourceRows = filteredHourly || [];
+      let minD = "9999-99-99", maxD = "0000-00-00";
+      for (const r of sourceRows) {
+        const d = r[C_DATE];
+        if (d && d !== "unknown") {
+          if (d < minD) minD = d;
+          if (d > maxD) maxD = d;
+        }
+      }
+      let cutoff = "";
+      if (minD <= maxD && dateSpanDays(minD, maxD) >= HOURLY_MAX_DAYS) {
+        cutoff = addDaysISO(maxD, -(HOURLY_MAX_DAYS - 1));
+        sourceRows = sourceRows.filter((r) => r[C_DATE] >= cutoff);
+        notes.push(`Showing the latest ${HOURLY_MAX_DAYS} days hourly (from ${cutoff}) — narrow the date range to inspect earlier hours`);
+      }
+      // Volume without hour-level timestamps (e.g. pre-cleanup Claude history) cannot be placed on the hour axis
+      let dailyTot = 0, hourlyTot = 0;
+      for (const r of filteredRows) {
+        if (cutoff && !(r[C_DATE] >= cutoff)) continue;
+        dailyTot += metricFromRow(r, metric);
+      }
+      for (const r of sourceRows) hourlyTot += metricFromRow(r, metric);
+      if (dailyTot > 0 && hourlyTot < dailyTot * 0.995) {
+        notes.push(`${fmtPct(dailyTot - hourlyTot, dailyTot)} of this volume has no hour-level timestamps (e.g. pre-cleanup Claude history) and is omitted`);
+      }
+    } else if (grain === "day") {
+      // Auto-upgrade to weekly grain if daily span > 366 days so long histories never truncate
       let minD = "9999-99-99", maxD = "0000-00-00";
       for (const r of filteredRows) {
         const d = r[C_DATE];
@@ -935,30 +1124,39 @@
           if (d > maxD) maxD = d;
         }
       }
-      if (minD <= maxD) {
-        const spanDays = (Date.parse(maxD) - Date.parse(minD)) / 86400000;
-        if (spanDays > 366) {
-          grain = "week";
-          autoWeekly = true;
-        }
+      if (minD <= maxD && dateSpanDays(minD, maxD) > 366) {
+        grain = "week";
+        notes.push("Auto-grouped by week (>1 year span)");
       }
     }
+
     if (subEl) {
-      subEl.textContent = autoWeekly
-        ? "Auto-grouped by week (>1 year span) · Click any legend item to filter, or click a bar to isolate a week"
-        : "Click any legend item to filter, or click a bar to isolate a date/week";
+      const hint =
+        grain === "hour"
+          ? "Local-time hourly buckets · Hover a legend item to highlight it, click to filter · Click a bar to isolate that day"
+          : "Hover a legend item to highlight it, click to filter · Click a bar to isolate a date/week";
+      subEl.textContent = [...notes, hint].join(" · ");
+    }
+
+    if (!sourceRows.length) {
+      const msg = grain === "hour" && filteredRows.length
+        ? "No hour-level activity for the current filters (re-run token-stats to index hourly timestamps)."
+        : "No token activity matches the current filters.";
+      svg.innerHTML = `<text x="${width / 2}" y="${height / 2}" text-anchor="middle" fill="var(--text-muted)">${esc(msg)}</text>`;
+      legendEl.innerHTML = "";
+      return;
     }
 
     const stackMode = state.chartStack;
-    const metric = state.metric;
-
+    const pad2 = (n) => String(n).padStart(2, "0");
     const seriesTotals = new Map();
     const bucketed = new Map();
 
-    for (const r of filteredRows) {
+    for (const r of sourceRows) {
       const rawDate = r[C_DATE];
       if (!rawDate || rawDate === "unknown") continue;
-      const period = grain === "week" ? weekStartISO(rawDate) : rawDate;
+      const period =
+        grain === "hour" ? `${rawDate}T${pad2(r[C_HOUR])}` : grain === "week" ? weekStartISO(rawDate) : rawDate;
       if (!bucketed.has(period)) bucketed.set(period, new Map());
       const pMap = bucketed.get(period);
 
@@ -1023,7 +1221,8 @@
     }
 
     const rankedSeries = [...seriesTotals.entries()].sort((a, b) => b[1] - a[1]);
-    const maxKeep = stackMode === "bucket" ? 6 : 7;
+    // Fold the tail into "Other" only when it holds 2+ series (a lone extra series keeps its own name)
+    const maxKeep = rankedSeries.length > TOP_SERIES + 1 ? TOP_SERIES : rankedSeries.length;
     const topKeys = rankedSeries.slice(0, maxKeep).map((e) => e[0]);
     const topSet = new Set(topKeys);
     const hasOther = rankedSeries.length > maxKeep;
@@ -1032,14 +1231,26 @@
     const sortedPeriods = [...bucketed.keys()].sort();
     const periods = [];
     if (sortedPeriods.length > 0) {
-      const [sy, sm, sd] = sortedPeriods[0].split("-").map(Number);
-      const [ey, em, ed] = sortedPeriods[sortedPeriods.length - 1].split("-").map(Number);
-      const cur = new Date(Date.UTC(sy, sm - 1, sd));
-      const end = new Date(Date.UTC(ey, em - 1, ed));
-      const stepDays = grain === "week" ? 7 : 1;
-      while (cur <= end && periods.length < 1500) {
-        periods.push(cur.toISOString().slice(0, 10));
-        cur.setUTCDate(cur.getUTCDate() + stepDays);
+      const first = sortedPeriods[0];
+      const last = sortedPeriods[sortedPeriods.length - 1];
+      const [sy, sm, sd] = first.slice(0, 10).split("-").map(Number);
+      const [ey, em, ed] = last.slice(0, 10).split("-").map(Number);
+      if (grain === "hour") {
+        // Whole local days, midnight to 23:00, so a single isolated day always shows 24 bars
+        let cur = Date.UTC(sy, sm - 1, sd, 0);
+        const end = Date.UTC(ey, em - 1, ed, 23);
+        while (cur <= end && periods.length < 24 * (HOURLY_MAX_DAYS + 1)) {
+          periods.push(new Date(cur).toISOString().slice(0, 13));
+          cur += 3600000;
+        }
+      } else {
+        const cur = new Date(Date.UTC(sy, sm - 1, sd));
+        const end = new Date(Date.UTC(ey, em - 1, ed));
+        const stepDays = grain === "week" ? 7 : 1;
+        while (cur <= end && periods.length < 1500) {
+          periods.push(cur.toISOString().slice(0, 10));
+          cur.setUTCDate(cur.getUTCDate() + stepDays);
+        }
       }
     }
 
@@ -1063,7 +1274,7 @@
 
     const n = periodData.length || 1;
     const stepX = plotW / n;
-    const barW = Math.max(1.5, Math.min(34, stepX * 0.78));
+    const barW = Math.max(1, Math.min(34, stepX * (grain === "hour" ? 0.82 : 0.78)));
 
     let svgOut = "";
     const ticks = 4;
@@ -1075,9 +1286,19 @@
       svgOut += `<text x="${padL - 8}" y="${(y + 4).toFixed(1)}" text-anchor="end" fill="var(--text-dim)" font-size="11" font-family="var(--mono)">${fmtMetric(tickVal, metric)}</text>`;
     }
 
-    const colorMap = {};
-    finalKeys.forEach((k) => {
-      colorMap[k] = k === "Other" ? "#64748b" : colorForSeries(stackMode, k);
+    // Faint day separators in hourly view
+    if (grain === "hour" && n > 24) {
+      periodData.forEach((d, idx) => {
+        if (idx === 0 || !d.period.endsWith("T00")) return;
+        const x = padL + idx * stepX;
+        svgOut += `<line x1="${x.toFixed(1)}" y1="${padT}" x2="${x.toFixed(1)}" y2="${padT + plotH}" stroke="var(--border)" stroke-width="1" />`;
+      });
+    }
+
+    const colorMap = colorsForSeries(stackMode, finalKeys);
+    const seriesIdx = {};
+    finalKeys.forEach((k, i) => {
+      seriesIdx[k] = i;
     });
 
     periodData.forEach((d, idx) => {
@@ -1090,24 +1311,52 @@
         const drawH = Math.min(yCursor - padT, Math.max(0.8, h));
         if (drawH <= 0) continue;
         yCursor -= drawH;
-        svgOut += `<rect x="${x.toFixed(2)}" y="${yCursor.toFixed(2)}" width="${barW.toFixed(2)}" height="${drawH.toFixed(2)}" fill="${colorMap[k]}" rx="1.2" />`;
+        // data-off: distance from this segment's bottom edge to the baseline (used by legend focus)
+        const off = padT + plotH - (yCursor + drawH);
+        svgOut += `<rect class="seg" data-s="${seriesIdx[k]}" data-off="${off.toFixed(2)}" x="${x.toFixed(2)}" y="${yCursor.toFixed(2)}" width="${barW.toFixed(2)}" height="${drawH.toFixed(2)}" fill="${colorMap[k]}" rx="${barW > 4 ? 1.2 : 0}" />`;
       }
       svgOut += `<rect class="bar-hit" data-idx="${idx}" x="${(padL + idx * stepX).toFixed(2)}" y="${padT}" width="${stepX.toFixed(2)}" height="${plotH}" fill="transparent" style="cursor:pointer" />`;
     });
 
-    const labelEvery = Math.max(1, Math.ceil(n / Math.max(1, Math.floor(plotW / 78))));
-    periodData.forEach((d, idx) => {
-      if (idx % labelEvery !== 0 && idx !== n - 1) return;
+    const labelAt = (idx, txt) => {
       const cx = padL + idx * stepX + stepX / 2;
-      const shortLbl = d.period.slice(5);
-      svgOut += `<text x="${cx.toFixed(1)}" y="${height - 8}" text-anchor="middle" fill="var(--text-dim)" font-size="11" font-family="var(--mono)">${shortLbl}</text>`;
-    });
+      svgOut += `<text x="${cx.toFixed(1)}" y="${height - 8}" text-anchor="middle" fill="var(--text-dim)" font-size="11" font-family="var(--mono)">${esc(txt)}</text>`;
+    };
+    if (grain === "hour") {
+      // Snap label spacing to clock-friendly steps so labels land on 00/06/12/18 etc.
+      const minPx = 58;
+      const stepsH = [1, 2, 3, 6, 12, 24, 48, 72, 168, 336];
+      const stepH = stepsH.find((s) => s * stepX >= minPx) || 336;
+      periodData.forEach((d, idx) => {
+        if (idx % stepH !== 0) return;
+        const hh = d.period.slice(11, 13);
+        const isMidnight = hh === "00";
+        labelAt(idx, isMidnight && (stepH >= 24 || n > 24) ? d.period.slice(5, 10) : `${hh}:00`);
+      });
+    } else {
+      const labelEvery = Math.max(1, Math.ceil(n / Math.max(1, Math.floor(plotW / 78))));
+      periodData.forEach((d, idx) => {
+        // Always label the final bar, unless it would collide with the previous regular label
+        const isLast = idx === n - 1 && ((n - 1) % labelEvery) * stepX >= 60;
+        if (idx % labelEvery !== 0 && !isLast) return;
+        labelAt(idx, d.period.slice(5));
+      });
+    }
 
     svg.innerHTML = svgOut;
 
+    const periodTitle = (p) => {
+      if (grain === "week") return "Week of " + p;
+      if (grain === "hour") {
+        const hNum = Number(p.slice(11, 13));
+        return `${p.slice(0, 10)} · ${pad2(hNum)}:00–${pad2((hNum + 1) % 24)}:00`;
+      }
+      return p;
+    };
+
     svg.querySelectorAll(".bar-hit").forEach((rect) => {
       rect.addEventListener("mouseenter", () => {
-        rect.setAttribute("fill", "rgba(255,255,255,0.05)");
+        rect.setAttribute("fill", "rgba(127,127,127,0.07)");
       });
       rect.addEventListener("mousemove", (ev) => {
         const d = periodData[Number(rect.dataset.idx)];
@@ -1125,18 +1374,12 @@
           .join("");
         tooltip.innerHTML = `
           <div class="tt-title">
-            <span>${grain === "week" ? "Week of " + d.period : d.period}</span>
+            <span>${esc(periodTitle(d.period))}</span>
             <span class="num">${fmtMetric(d.total, metric)}</span>
           </div>
           ${rowsHtml || '<div style="color:var(--text-dim)">No activity</div>'}
         `;
-        tooltip.hidden = false;
-        const tw = tooltip.offsetWidth || 250;
-        const th = tooltip.offsetHeight || 140;
-        const tx = Math.max(12, Math.min(window.innerWidth - tw - 12, ev.clientX + 14));
-        const ty = Math.max(12, Math.min(window.innerHeight - th - 12, ev.clientY - 24));
-        tooltip.style.left = tx + "px";
-        tooltip.style.top = ty + "px";
+        positionTooltip(tooltip, ev);
       });
       rect.addEventListener("mouseleave", () => {
         rect.setAttribute("fill", "transparent");
@@ -1145,38 +1388,50 @@
       rect.addEventListener("click", () => {
         const d = periodData[Number(rect.dataset.idx)];
         if (!d) return;
-        state.rangePreset = "custom";
-        document.querySelectorAll("#range-presets .seg-btn").forEach((b) => b.classList.remove("active"));
         if (grain === "week") {
-          const [y, m, day] = d.period.split("-").map(Number);
-          const endDt = new Date(Date.UTC(y, m - 1, day + 6));
-          state.dateFrom = d.period;
-          state.dateTo = endDt.toISOString().slice(0, 10);
+          isolateDates(d.period, addDaysISO(d.period, 6));
         } else {
-          state.dateFrom = d.period;
-          state.dateTo = d.period;
+          const day = d.period.slice(0, 10);
+          isolateDates(day, day);
         }
-        document.getElementById("date-from").value = state.dateFrom;
-        document.getElementById("date-to").value = state.dateTo;
         tooltip.hidden = true;
-        renderAll();
       });
     });
 
     const otherSum = rankedSeries.slice(maxKeep).reduce((s, e) => s + e[1], 0);
+    const otherCount = rankedSeries.length - maxKeep;
     legendEl.innerHTML = finalKeys
       .map((k) => {
         const tot = k === "Other" ? otherSum : (seriesTotals.get(k) || 0);
         const clickable = k !== "Other" && stackMode !== "bucket";
+        const label = k === "Other" ? `Other (${otherCount})` : ACTOR_LABELS[k] || k;
         return `
-          <span class="legend-item" ${clickable ? `data-filter-key="${esc(k)}"` : ""}>
+          <span class="legend-item" data-s="${seriesIdx[k]}" ${clickable ? `data-filter-key="${esc(k)}"` : ""}>
             <span class="swatch" style="background:${colorMap[k]}"></span>
-            <span>${esc(ACTOR_LABELS[k] || k)}</span>
+            <span>${esc(label)}</span>
             <strong class="num" style="color:var(--text)">${fmtMetric(tot, metric)}</strong>
           </span>
         `;
       })
       .join("");
+
+    // Legend hover: spotlight one series (dropped onto the baseline so its own shape is readable),
+    // fade the rest of the chart and the other legend entries
+    const segs = svg.querySelectorAll("rect.seg");
+    const legendItems = legendEl.querySelectorAll(".legend-item");
+    const setFocus = (si) => {
+      svg.classList.toggle("series-focus", si !== null);
+      segs.forEach((r) => {
+        const on = si !== null && r.dataset.s === si;
+        r.classList.toggle("is-focus", on);
+        r.style.transform = on && Number(r.dataset.off) > 0 ? `translateY(${r.dataset.off}px)` : "";
+      });
+      legendItems.forEach((el) => el.classList.toggle("is-dim", si !== null && el.dataset.s !== si));
+    };
+    legendItems.forEach((el) => {
+      el.addEventListener("mouseenter", () => setFocus(el.dataset.s));
+      el.addEventListener("mouseleave", () => setFocus(null));
+    });
 
     legendEl.querySelectorAll("[data-filter-key]").forEach((el) => {
       el.addEventListener("click", () => {
@@ -1185,11 +1440,178 @@
     });
   }
 
+  function positionTooltip(tooltip, ev) {
+    tooltip.hidden = false;
+    const tw = tooltip.offsetWidth || 250;
+    const th = tooltip.offsetHeight || 140;
+    const tx = Math.max(12, Math.min(window.innerWidth - tw - 12, ev.clientX + 14));
+    const ty = Math.max(12, Math.min(window.innerHeight - th - 12, ev.clientY - 24));
+    tooltip.style.left = tx + "px";
+    tooltip.style.top = ty + "px";
+  }
+
+  function isolateDates(from, to) {
+    state.rangePreset = "custom";
+    document.querySelectorAll("#range-presets .seg-btn").forEach((b) => b.classList.remove("active"));
+    state.dateFrom = from;
+    state.dateTo = to;
+    document.getElementById("date-from").value = state.dateFrom;
+    document.getElementById("date-to").value = state.dateTo;
+    renderAll();
+  }
+
+  // -------------------------------------------------------------------------
+  // GitHub-style Daily Activity Calendar
+  // -------------------------------------------------------------------------
+
+  function renderActivityCalendar(filteredRows) {
+    const wrap = document.getElementById("calendar-wrap");
+    const statsEl = document.getElementById("calendar-stats");
+    const tooltip = document.getElementById("chart-tooltip");
+    if (!wrap) return;
+    const metric = state.metric;
+
+    const dayVals = new Map();
+    const dayCalls = new Map();
+    let minD = "9999-99-99", maxD = "0000-00-00";
+    for (const r of filteredRows) {
+      const d = r[C_DATE];
+      if (!d || d === "unknown") continue;
+      const v = metricFromRow(r, metric);
+      dayVals.set(d, (dayVals.get(d) || 0) + v);
+      dayCalls.set(d, (dayCalls.get(d) || 0) + r[C_CALLS]);
+      if (d < minD) minD = d;
+      if (d > maxD) maxD = d;
+    }
+
+    const from = state.dateFrom || (minD <= maxD ? minD : "");
+    const to = state.dateTo || (minD <= maxD ? maxD : "");
+    if (!from || !to || from > to) {
+      wrap.innerHTML = `<div class="empty-note">No token activity matches the current filters.</div>`;
+      statsEl.innerHTML = "";
+      return;
+    }
+
+    const gridStart = weekStartISO(from);
+    const totalDays = dateSpanDays(gridStart, to) + 1;
+    const weeks = Math.max(1, Math.ceil(totalDays / 7));
+
+    // Quartile intensity levels over active days (robust to a few huge burst days)
+    const nonZero = [...dayVals.entries()]
+      .filter(([d, v]) => v > 0 && d >= from && d <= to)
+      .map(([, v]) => v)
+      .sort((a, b) => a - b);
+    const q = (p) => (nonZero.length ? nonZero[Math.min(nonZero.length - 1, Math.floor(p * nonZero.length))] : 0);
+    const thresholds = [q(0.25), q(0.5), q(0.75)];
+    const levelOf = (v) => {
+      if (!(v > 0)) return 0;
+      if (v <= thresholds[0]) return 1;
+      if (v <= thresholds[1]) return 2;
+      if (v <= thresholds[2]) return 3;
+      return 4;
+    };
+
+    const labelW = 30, topH = 18, gap = 3;
+    const availW = Math.max(240, (wrap.clientWidth || 900) - labelW - 4);
+    const cell = Math.max(10, Math.min(24, Math.floor(availW / weeks) - gap));
+    const pitch = cell + gap;
+    const svgW = labelW + weeks * pitch;
+    const svgH = topH + 7 * pitch;
+    const heat = PALETTE.heat;
+
+    let out = "";
+    const dowLbl = ["Mon", "", "Wed", "", "Fri", "", ""];
+    dowLbl.forEach((lbl, i) => {
+      if (!lbl) return;
+      out += `<text x="${labelW - 6}" y="${topH + i * pitch + cell - 1}" text-anchor="end" font-size="10" fill="var(--text-dim)">${lbl}</text>`;
+    });
+
+    let lastMonth = "";
+    let lastMonthX = -1;
+    for (let w = 0; w < weeks; w++) {
+      const x = labelW + w * pitch;
+      // Month label above the first column of each month (by the column's last visible day)
+      const colEnd = addDaysISO(gridStart, w * 7 + 6);
+      const ym = (colEnd > to ? to : colEnd).slice(0, 7);
+      if (ym !== lastMonth) {
+        if (x - lastMonthX >= 28 || lastMonthX < 0) {
+          const [yy, mm] = ym.split("-").map(Number);
+          const showYear = mm === 1 || lastMonthX < 0;
+          out += `<text x="${x}" y="${topH - 6}" font-size="10" fill="var(--text-dim)">${MONTH_NAMES[mm - 1]}${showYear ? " " + yy : ""}</text>`;
+          lastMonthX = x;
+        }
+        lastMonth = ym;
+      }
+      for (let dow = 0; dow < 7; dow++) {
+        const d = addDaysISO(gridStart, w * 7 + dow);
+        if (d > to) break;
+        const y = topH + dow * pitch;
+        if (d < from) continue;
+        const v = dayVals.get(d) || 0;
+        const lvl = levelOf(v);
+        out += `<rect class="cal-cell" data-date="${d}" x="${x}" y="${y}" width="${cell}" height="${cell}" rx="2.5" fill="${heat[lvl]}" />`;
+      }
+    }
+
+    wrap.innerHTML = `<svg class="calendar-svg" width="${svgW}" height="${svgH}" viewBox="0 0 ${svgW} ${svgH}" role="img" aria-label="Daily activity calendar">${out}</svg>`;
+
+    const dowFull = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+    wrap.querySelectorAll(".cal-cell").forEach((el) => {
+      el.addEventListener("mousemove", (ev) => {
+        const d = el.dataset.date;
+        const v = dayVals.get(d) || 0;
+        const [y, m, dd] = d.split("-").map(Number);
+        const wd = dowFull[new Date(Date.UTC(y, m - 1, dd)).getUTCDay()];
+        tooltip.innerHTML = `
+          <div class="tt-title"><span>${wd} ${esc(d)}</span><span class="num">${v > 0 ? fmtMetric(v, metric) : "—"}</span></div>
+          <div class="tt-row"><span>${v > 0 ? "API calls" : "No activity"}</span><span class="num">${v > 0 ? (dayCalls.get(d) || 0).toLocaleString() : ""}</span></div>
+        `;
+        positionTooltip(tooltip, ev);
+      });
+      el.addEventListener("mouseleave", () => {
+        tooltip.hidden = true;
+      });
+      el.addEventListener("click", () => {
+        tooltip.hidden = true;
+        isolateDates(el.dataset.date, el.dataset.date);
+      });
+    });
+
+    // Streaks & summary over the visible range
+    let activeDays = 0, rangeDays = 0, longest = 0, run = 0, busiest = null, sumActive = 0;
+    for (let d = from; d <= to; d = addDaysISO(d, 1)) {
+      rangeDays++;
+      const v = dayVals.get(d) || 0;
+      if (v > 0) {
+        activeDays++;
+        sumActive += v;
+        run++;
+        longest = Math.max(longest, run);
+        if (!busiest || v > busiest[1]) busiest = [d, v];
+      } else {
+        run = 0;
+      }
+      if (rangeDays > 20000) break;
+    }
+    const current = run;
+    const legendCells = heat
+      .map((c) => `<span class="cal-swatch" style="background:${c}"></span>`)
+      .join("");
+    statsEl.innerHTML = `
+      <span>Active days <strong class="num">${activeDays}</strong> / ${rangeDays}</span>
+      <span>Longest streak <strong class="num">${longest}</strong> d</span>
+      <span>Current streak <strong class="num">${current}</strong> d</span>
+      <span>Avg / active day <strong class="num">${fmtMetric(activeDays ? sumActive / activeDays : 0, metric)}</strong></span>
+      ${busiest ? `<span>Busiest <strong class="num">${esc(busiest[0])}</strong> (${fmtMetric(busiest[1], metric)})</span>` : ""}
+      <span class="cal-legend">Less ${legendCells} More</span>
+    `;
+  }
+
   // -------------------------------------------------------------------------
   // Token Anatomy & Actor Role / Day-of-Week
   // -------------------------------------------------------------------------
 
-  function renderAnatomyAndRoles(grand, filteredRows, actorDimRows) {
+  function renderAnatomyAndRoles(grand, filteredRows, actorDimRows, filteredHourly) {
     const barEl = document.getElementById("anatomy-bar");
     const bucketsEl = document.getElementById("anatomy-buckets");
     const tot = Math.max(1, grand.total);
@@ -1290,6 +1712,38 @@
         `;
       })
       .join("");
+
+    // Hour-of-day profile (local time, 00..23)
+    const hodVals = new Array(24).fill(0);
+    for (const r of filteredHourly || []) {
+      const h = r[C_HOUR];
+      if (h >= 0 && h < 24) hodVals[h] += metricFromRow(r);
+    }
+    const maxHod = Math.max(...hodVals, 0);
+    const hodEl = document.getElementById("hod-grid");
+    if (hodEl) {
+      if (maxHod <= 0) {
+        hodEl.innerHTML = `<div class="hod-head"><span>Hour of day (local)</span><span>No hour-level data</span></div>`;
+      } else {
+        const peak = hodVals.indexOf(maxHod);
+        const p2 = (x) => String(x).padStart(2, "0");
+        hodEl.innerHTML = `
+          <div class="hod-head">
+            <span>Hour of day (local)</span>
+            <span>Peak <strong class="num">${p2(peak)}:00–${p2((peak + 1) % 24)}:00</strong> · ${fmtMetric(maxHod)}</span>
+          </div>
+          <div class="hod-bars">
+            ${hodVals
+              .map((v, h) => {
+                const pct = maxHod > 0 ? (v / maxHod) * 100 : 0;
+                return `<div class="hod-col" title="${p2(h)}:00–${p2((h + 1) % 24)}:00 · ${fmtMetric(v)}"><div class="hod-fill" style="height:${v > 0 ? Math.max(3, pct).toFixed(1) : 0}%"></div></div>`;
+              })
+              .join("")}
+          </div>
+          <div class="hod-axis">${hodVals.map((_, h) => `<span>${h % 3 === 0 ? p2(h) : ""}</span>`).join("")}</div>
+        `;
+      }
+    }
   }
 
   // -------------------------------------------------------------------------
@@ -2041,6 +2495,7 @@
       const resp = await fetch("/api/refresh", { method: "POST" });
       if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
       rawData = await resp.json();
+      onDataLoaded();
       billingOverrides = loadSavedBillingOverrides();
       renderMonthPresets();
       if (state.rangePreset !== "custom") applyRangePreset(state.rangePreset);
@@ -2062,6 +2517,7 @@
     if (!rawData || !rawData.cube) return;
     recomputeBillingAllocations();
     const filteredRows = rawData.cube.filter((r) => rowMatches(r));
+    const filteredHourly = hourlyRows.filter((r) => rowMatches(r));
     const grand = emptyAgg("grand");
     for (const r of filteredRows) addRowToAgg(grand, r);
     finalizeAgg(grand);
@@ -2071,8 +2527,9 @@
     renderHeaderAndChips(matchedSessions.length);
     renderKPIs(grand, matchedSessions.length);
     renderBillingPanel();
-    renderTimeline(filteredRows);
-    renderAnatomyAndRoles(grand, filteredRows, rawData.cube.filter((r) => rowMatches(r, "actor")));
+    renderTimeline(filteredRows, filteredHourly);
+    renderActivityCalendar(filteredRows);
+    renderAnatomyAndRoles(grand, filteredRows, rawData.cube.filter((r) => rowMatches(r, "actor")), filteredHourly);
     renderCompactDimTable(
       "harness-table-wrap",
       "harness",
@@ -2099,11 +2556,13 @@
   function init() {
     const savedTheme = localStorage.getItem(STORAGE_THEME_KEY) || "dark";
     document.documentElement.setAttribute("data-theme", savedTheme);
+    applyThemePalette(savedTheme);
 
     document.getElementById("btn-theme").addEventListener("click", () => {
       const cur = document.documentElement.getAttribute("data-theme");
       const next = cur === "light" ? "dark" : "light";
       document.documentElement.setAttribute("data-theme", next);
+      applyThemePalette(next);
       localStorage.setItem(STORAGE_THEME_KEY, next);
       renderAll();
     });
@@ -2316,11 +2775,15 @@
     window.addEventListener("resize", () => {
       cancelAnimationFrame(resizeRaf);
       resizeRaf = requestAnimationFrame(() => {
-        if (rawData) renderTimeline(rawData.cube.filter((r) => rowMatches(r)));
+        if (!rawData) return;
+        const rows = rawData.cube.filter((r) => rowMatches(r));
+        renderTimeline(rows, hourlyRows.filter((r) => rowMatches(r)));
+        renderActivityCalendar(rows);
       });
     });
 
     if (rawData) {
+      onDataLoaded();
       billingOverrides = loadSavedBillingOverrides();
       renderMonthPresets();
       applyRangePreset("all");
@@ -2330,6 +2793,7 @@
         .then((r) => r.json())
         .then((d) => {
           rawData = d;
+          onDataLoaded();
           billingOverrides = loadSavedBillingOverrides();
           renderMonthPresets();
           applyRangePreset("all");

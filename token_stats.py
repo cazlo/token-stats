@@ -59,7 +59,7 @@ WEB_DATA_JS_PATH = WEB_DIR / "data.js"
 HOME = Path.home()
 LOCAL_TZ = dt.datetime.now().astimezone().tzinfo
 
-CACHE_SCHEMA_VERSION = "6"
+CACHE_SCHEMA_VERSION = "7"
 EXTRACT_LOCK = threading.Lock()
 _LOCAL_CFG_CACHE: tuple[int, dict[str, Any]] | None = None
 
@@ -131,6 +131,53 @@ def epoch_to_local_date(ts_sec: float | int | None) -> str:
         return dt.datetime.fromtimestamp(ts_sec, tz=LOCAL_TZ).strftime("%Y-%m-%d")
     except (OSError, OverflowError, ValueError):
         return "unknown"
+
+
+def epoch_to_local_hour_key(ts_sec: float | int | None) -> str:
+    """Local "YYYY-MM-DDTHH" bucket key for an epoch timestamp (seconds or ms), or "unknown"."""
+    if not ts_sec or ts_sec <= 0:
+        return "unknown"
+    if ts_sec > 1e11:
+        ts_sec = ts_sec / 1000.0
+    try:
+        return dt.datetime.fromtimestamp(ts_sec, tz=LOCAL_TZ).strftime("%Y-%m-%dT%H")
+    except (OSError, OverflowError, ValueError):
+        return "unknown"
+
+
+def iso_to_local_hour_key(iso_str: str | None) -> str:
+    """Local "YYYY-MM-DDTHH" bucket key for an ISO timestamp; falls back to a bare date or "unknown"."""
+    if not iso_str:
+        return "unknown"
+    s = iso_str.strip()
+    if len(s) >= 10 and s[4] == "-" and s[7] == "-":
+        try:
+            if s.endswith("Z"):
+                s = s[:-1] + "+00:00"
+            parsed = dt.datetime.fromisoformat(s)
+            if parsed.tzinfo is not None:
+                parsed = parsed.astimezone(LOCAL_TZ)
+            if len(s) <= 10:
+                return parsed.strftime("%Y-%m-%d")
+            return parsed.strftime("%Y-%m-%dT%H")
+        except ValueError:
+            return s[:10]
+    return "unknown"
+
+
+def hour_key_date(key: str) -> str:
+    """Strip the hour suffix from a "YYYY-MM-DDTHH" (or bare date / "unknown") bucket key."""
+    return key[:10] if key and key != "unknown" else "unknown"
+
+
+def split_hour_key(key: str) -> tuple[str, int]:
+    """("YYYY-MM-DD", hour 0..23) from a bucket key; hour is -1 when unknown."""
+    if key and len(key) == 13 and key[10] == "T":
+        try:
+            return key[:10], int(key[11:13])
+        except ValueError:
+            return key[:10], -1
+    return hour_key_date(key), -1
 
 
 def iso_to_local_date(iso_str: str | None) -> str:
@@ -598,7 +645,8 @@ def extract_claude(cache_con: sqlite3.Connection, pool: ProcessPoolExecutor | No
 
     for sid, rec in global_calls.values():
         model_raw, ts, cwd, actor, inp, cr, cw, out_txt, reas = rec[:9]
-        date_str = iso_to_local_date(ts)
+        hour_key = iso_to_local_hour_key(ts)
+        date_str = hour_key_date(hour_key)
         if date_str != "unknown":
             if date_str < min_live_date:
                 min_live_date = date_str
@@ -609,7 +657,7 @@ def extract_claude(cache_con: sqlite3.Connection, pool: ProcessPoolExecutor | No
             project_raw_paths[proj].add(clean_path)
         model, provider = normalize_model_and_provider(model_raw, "anthropic", "Claude Code")
 
-        key = (date_str, "Claude Code", provider, model, proj, actor, 0)
+        key = (hour_key, "Claude Code", provider, model, proj, actor, 0)
         b = cube_acc[key]
         b[0] += 1
         b[1] += inp
@@ -909,7 +957,7 @@ def _parse_codex_rollout(path: str) -> dict[str, Any]:
                         l_reas = int(ltu.get("reasoning_output_tokens") or 0)
                         l_tot = int(ltu.get("total_tokens") or (l_in + l_out))
 
-                        date_str = iso_to_local_date(ev.get("timestamp"))
+                        date_str = iso_to_local_hour_key(ev.get("timestamp"))
                         is_comp_base = 1 if c_tot in compacted_totals else 0
                         events.append(
                             [
@@ -1236,13 +1284,14 @@ def extract_codex(cache_con: sqlite3.Connection, pool: ProcessPoolExecutor | Non
                 if turn_sum <= 0:
                     continue
 
-                eff_date = d_str if d_str != "unknown" else fallback_date
+                eff_key = d_str if d_str != "unknown" else fallback_date
+                eff_date = hour_key_date(eff_key)
                 if eff_date != "unknown":
                     min_date = min(min_date, eff_date)
                     max_date = max(max_date, eff_date)
 
                 model_id, provider = normalize_model_and_provider(m_turn or db_model, model_provider, "Codex")
-                key = (eff_date, "Codex", provider, model_id, proj, actor, 0)
+                key = (eff_key, "Codex", provider, model_id, proj, actor, 0)
                 b = cube_acc[key]
                 b[0] += 1
                 b[1] += uncached_in
@@ -1624,7 +1673,7 @@ def extract_opencode(cache_con: sqlite3.Connection) -> dict[str, Any]:
                     (
                         mid,
                         sid,
-                        epoch_to_local_date(t_created),
+                        epoch_to_local_hour_key(t_created),
                         str(o.get("modelID") or ""),
                         str(o.get("providerID") or ""),
                         inp,
@@ -1668,7 +1717,7 @@ def extract_opencode(cache_con: sqlite3.Connection) -> dict[str, Any]:
                     (
                         mid,
                         sid,
-                        epoch_to_local_date(t_created),
+                        epoch_to_local_hour_key(t_created),
                         str(m_id or ""),
                         str(p_id or ""),
                         inp_i,
@@ -1717,13 +1766,14 @@ def extract_opencode(cache_con: sqlite3.Connection) -> dict[str, Any]:
         eff_m = m_id or meta["m_id"]
         eff_p = p_id or meta["p_id"]
         model, provider = normalize_model_and_provider(eff_m, eff_p, "OpenCode")
-        eff_date = d_str if d_str != "unknown" else meta["date"]
+        eff_key = d_str if d_str != "unknown" else meta["date"]
+        eff_date = hour_key_date(eff_key)
 
         if eff_date != "unknown":
             min_date = min(min_date, eff_date)
             max_date = max(max_date, eff_date)
 
-        key = (eff_date, "OpenCode", provider, model, proj, actor, 0)
+        key = (eff_key, "OpenCode", provider, model, proj, actor, 0)
         b = cube_acc[key]
         b[0] += 1
         b[1] += inp
@@ -1831,7 +1881,8 @@ def extract_opencode(cache_con: sqlite3.Connection) -> dict[str, Any]:
     non_promo_logged_usd = 0.0
     promo_min_date, promo_max_date = "9999-99-99", "0000-00-00"
     paid_min_date, paid_max_date = "9999-99-99", "0000-00-00"
-    for (_d, _h, prov_oc, _m, _p, _a, _arch), vals_oc in cube_acc.items():
+    for (_dk, _h, prov_oc, _m, _p, _a, _arch), vals_oc in cube_acc.items():
+        _d = hour_key_date(_dk)
         c_val = float(vals_oc[6] or 0.0)
         if c_val <= 0:
             continue
@@ -2305,14 +2356,15 @@ def extract_antigravity(cache_con: sqlite3.Connection, pool: ProcessPoolExecutor
 
         for rec in payload.get("gens") or []:
             ts_val, raw_m, inp, cr, cw, out_txt, reas = rec
-            d_str = epoch_to_local_date(ts_val) if is_db else iso_to_local_date(str(ts_val))
-            eff_date = d_str if d_str != "unknown" else fallback_date
+            d_key = epoch_to_local_hour_key(ts_val) if is_db else iso_to_local_hour_key(str(ts_val))
+            eff_key = d_key if d_key != "unknown" else fallback_date
+            eff_date = hour_key_date(eff_key)
             if eff_date != "unknown":
                 min_date = min(min_date, eff_date)
                 max_date = max(max_date, eff_date)
 
             model, provider = normalize_model_and_provider(raw_m, None, "Antigravity")
-            key = (eff_date, "Antigravity", provider, model, proj, actor, 0)
+            key = (eff_key, "Antigravity", provider, model, proj, actor, 0)
             b = cube_acc[key]
             b[0] += 1
             b[1] += inp
@@ -2853,11 +2905,22 @@ def _extract_all_locked(rebuild: bool = False) -> dict[str, Any]:
     merged_proj_paths: dict[str, set[str]] = defaultdict(set)
     health_list: list[dict[str, Any]] = []
 
+    # Extractors key cube cells by a local "YYYY-MM-DDTHH" bucket (or a bare date when the hour is
+    # unknown). Roll those up into the daily cube and keep a parallel per-hour breakdown of each cell.
+    hourly_acc: dict[tuple[tuple[str, str, str, str, str, str, int], int], list[float]] = defaultdict(
+        lambda: [0, 0, 0, 0, 0, 0, 0.0]
+    )
     for res in (claude_res, codex_res, oc_res, ag_res):
         for k, vals in res["cube"].items():
-            b = merged_cube[k]
+            date_s, hour = split_hour_key(k[0])
+            day_k = (date_s, *k[1:])
+            b = merged_cube[day_k]
             for i in range(7):
                 b[i] += vals[i]
+            if hour >= 0:
+                hb = hourly_acc[(day_k, hour)]
+                for i in range(7):
+                    hb[i] += vals[i]
         all_sessions.extend(res["sessions"])
         for proj, paths in res["project_paths"].items():
             merged_proj_paths[proj].update(paths)
@@ -2870,6 +2933,7 @@ def _extract_all_locked(rebuild: bool = False) -> dict[str, Any]:
         sess_counts_by_cell[ck] += 1
 
     cube_rows = []
+    cube_row_index: dict[tuple[str, str, str, str, str, str, int], int] = {}
     distinct_models: dict[str, str] = {}
     for k in sorted(merged_cube.keys()):
         date_s, harness, provider, model, project, actor, archived = k
@@ -2877,6 +2941,7 @@ def _extract_all_locked(rebuild: bool = False) -> dict[str, Any]:
         if (inp + cr + cw + out_txt + reas) == 0 and cost == 0:
             continue
         distinct_models[model] = provider
+        cube_row_index[k] = len(cube_rows)
         cube_rows.append(
             [
                 date_s,
@@ -2895,6 +2960,19 @@ def _extract_all_locked(rebuild: bool = False) -> dict[str, Any]:
                 int(reas),
                 round(float(cost), 6),
             ]
+        )
+
+    # Compact hourly breakdown: each row points back at its daily cube row (dimensions live there)
+    cube_hourly_rows = []
+    for (day_k, hour) in sorted(hourly_acc.keys(), key=lambda hk: (cube_row_index.get(hk[0], -1), hk[1])):
+        row_idx = cube_row_index.get(day_k)
+        if row_idx is None:
+            continue
+        calls, inp, cr, cw, out_txt, reas, cost = hourly_acc[(day_k, hour)]
+        if (inp + cr + cw + out_txt + reas) == 0 and cost == 0:
+            continue
+        cube_hourly_rows.append(
+            [row_idx, hour, int(calls), int(inp), int(cr), int(cw), int(out_txt), int(reas), round(float(cost), 6)]
         )
 
     # Align active_tokens with frontend (fresh prompt input + cache write + output + reasoning)
@@ -2938,6 +3016,18 @@ def _extract_all_locked(rebuild: bool = False) -> dict[str, Any]:
             "logged_cost_usd",
         ],
         "cube": cube_rows,
+        "cube_hourly_columns": [
+            "cube_row",
+            "hour",
+            "calls",
+            "input_uncached",
+            "cache_read",
+            "cache_write",
+            "output_text",
+            "reasoning",
+            "logged_cost_usd",
+        ],
+        "cube_hourly": cube_hourly_rows,
         "top_sessions": ranked_sessions,
         "default_rates_per_1m": default_rates,
         "billing": billing_summary,

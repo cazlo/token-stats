@@ -104,7 +104,7 @@
       <div class="panel-header">
         <div>
           <h2 class="panel-title">Token Velocity Over Time</h2>
-          <p class="panel-subtitle" id="timeline-subtitle">Click any legend item to filter, or click a bar to isolate a date/week</p>
+          <p class="panel-subtitle" id="timeline-subtitle">Hover a legend item to highlight it, click to filter · Click a bar to isolate a date/week</p>
         </div>
         <div class="control-group">
           <span class="control-label">Stack By</span>
@@ -117,6 +117,7 @@
             <button class="seg-btn" data-stack="actor">Role</button>
           </div>
           <div class="seg-group" id="chart-grain-group">
+            <button class="seg-btn" data-grain="hour">Hourly</button>
             <button class="seg-btn active" data-grain="day">Daily</button>
             <button class="seg-btn" data-grain="week">Weekly</button>
           </div>
@@ -127,6 +128,18 @@
         <svg class="chart-svg" id="timeline-svg"></svg>
       </div>
       <div class="chart-legend" id="timeline-legend"></div>
+    </section>
+
+    <!-- GitHub-style Daily Activity Calendar -->
+    <section class="panel">
+      <div class="panel-header">
+        <div>
+          <h2 class="panel-title">Daily Activity Calendar</h2>
+          <p class="panel-subtitle">One cell per day, shaded by quartile of the active Primary Metric · Click a day to isolate it</p>
+        </div>
+      </div>
+      <div class="calendar-wrap" id="calendar-wrap"></div>
+      <div class="calendar-stats" id="calendar-stats"></div>
     </section>
 
     <!-- Token Anatomy + Subagent Swarm Split -->
@@ -145,12 +158,13 @@
       <section class="panel">
         <div class="panel-header">
           <div>
-            <h2 class="panel-title">Execution Role &amp; Day-of-Week Cadence</h2>
+            <h2 class="panel-title">Execution Role, Day-of-Week &amp; Hour-of-Day Cadence</h2>
             <p class="panel-subtitle">Click a role (`subagent`, `main`, `auto_review`) to cross-filter everything</p>
           </div>
         </div>
         <div class="role-rows" id="actor-rows"></div>
         <div class="dow-grid" id="dow-grid"></div>
+        <div class="hod-grid" id="hod-grid"></div>
       </section>
     </div>
 

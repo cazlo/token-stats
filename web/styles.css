@@ -12,16 +12,16 @@
   --accent: #5cc8ff;
   --accent-soft: rgba(92, 200, 255, 0.14);
 
-  /* Harness & Provider palette */
-  --c-claude: #e88b5a;
-  --c-codex: #4ade80;
-  --c-opencode: #60a5fa;
-  --c-antigravity: #c084fc;
+  /* Harness & Provider palette (brand-aligned; keep in sync with PALETTES in app.js) */
+  --c-claude: #e07a55;
+  --c-codex: #5a95f5;
+  --c-opencode: #c94fa8;
+  --c-antigravity: #86e3a5;
 
-  --c-anthropic: #e88b5a;
-  --c-openai: #34d399;
-  --c-google: #a78bfa;
-  --c-local-gpu: #fbbf24;
+  --c-anthropic: #e07a55;
+  --c-openai: #5a95f5;
+  --c-google: #86e3a5;
+  --c-local-gpu: #c94fa8;
 
   /* Token bucket palette */
   --t-uncached: #38bdf8;
@@ -54,6 +54,14 @@
   --t-cread: #94a3b8;
   --t-cread-bright: #64748b;
   --shadow: 0 4px 18px rgba(15, 23, 42, 0.07);
+  --c-claude: #e0784a;
+  --c-codex: #2563eb;
+  --c-opencode: #b8389a;
+  --c-antigravity: #0f6b2f;
+  --c-anthropic: #e0784a;
+  --c-openai: #2563eb;
+  --c-google: #0f6b2f;
+  --c-local-gpu: #b8389a;
 }
 
 * {
@@ -436,6 +444,134 @@ button.active, .seg-btn.active {
 .legend-item:hover {
   background: var(--bg-hover);
   color: var(--text);
+}
+
+.legend-item {
+  transition: opacity 0.12s ease;
+}
+
+.legend-item.is-dim {
+  opacity: 0.4;
+}
+
+.chart-svg rect.seg {
+  transition: opacity 0.12s ease, transform 0.18s ease;
+}
+
+.chart-svg.series-focus rect.seg {
+  opacity: 0.12;
+}
+
+.chart-svg.series-focus rect.seg.is-focus {
+  opacity: 1;
+}
+
+/* GitHub-style activity calendar */
+.calendar-wrap {
+  width: 100%;
+  overflow-x: auto;
+  padding-bottom: 4px;
+}
+
+.calendar-svg {
+  display: block;
+}
+
+.calendar-svg .cal-cell {
+  cursor: pointer;
+  stroke: transparent;
+  stroke-width: 1.5;
+}
+
+.calendar-svg .cal-cell:hover {
+  stroke: var(--text-muted);
+}
+
+.calendar-stats {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 18px;
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: 1px solid var(--border);
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.calendar-stats strong {
+  color: var(--text);
+}
+
+.cal-legend {
+  margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+}
+
+.cal-swatch {
+  width: 11px;
+  height: 11px;
+  border-radius: 2.5px;
+  display: inline-block;
+}
+
+.empty-note {
+  color: var(--text-muted);
+  padding: 24px 0;
+  text-align: center;
+}
+
+/* Hour-of-day cadence strip */
+.hod-grid {
+  margin-top: 12px;
+  padding-top: 10px;
+  border-top: 1px solid var(--border);
+}
+
+.hod-head {
+  display: flex;
+  justify-content: space-between;
+  font-size: 11.5px;
+  color: var(--text-dim);
+  margin-bottom: 6px;
+}
+
+.hod-head strong {
+  color: var(--text);
+}
+
+.hod-bars {
+  display: grid;
+  grid-template-columns: repeat(24, 1fr);
+  gap: 3px;
+  height: 54px;
+  align-items: end;
+}
+
+.hod-col {
+  height: 100%;
+  display: flex;
+  align-items: flex-end;
+  background: var(--bg-subtle);
+  border-radius: 3px;
+}
+
+.hod-fill {
+  width: 100%;
+  background: var(--accent);
+  border-radius: 3px 3px 0 0;
+}
+
+.hod-axis {
+  display: grid;
+  grid-template-columns: repeat(24, 1fr);
+  gap: 3px;
+  margin-top: 3px;
+  font-size: 9.5px;
+  font-family: var(--mono);
+  color: var(--text-dim);
 }
 
 .swatch {

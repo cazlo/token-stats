@@ -59,3 +59,11 @@ Different providers report token fields differently (e.g., Codex `input_tokens` 
 3. `cache_read` — Reused cached prompt tokens
 4. `output_text` — Visible non-reasoning completion tokens
 5. `reasoning` — Thinking / reasoning completion tokens
+
+## Time Views
+
+- **Token Velocity Over Time** stacks the top 10 series (harness, provider, project, model, token type or role) plus an `Other` bucket, at **Hourly**, **Daily** or **Weekly** grain. Hourly buckets use local time and show up to the latest 31 days of the selected range; pre-cleanup Claude history (`stats-cache.json`) has no hour-level timestamps and is left out of hourly views. Hover a legend item to spotlight that series on the baseline; click it to filter.
+- **Daily Activity Calendar** is a GitHub-style day grid shaded by quartile of the active Primary Metric, with active-day and streak stats. Click a day to isolate it.
+- **Hour-of-Day Cadence** sits next to the day-of-week profile.
+
+The payload carries a compact `cube_hourly` table alongside the daily `cube`: each row is `[cube_row, hour, calls, input_uncached, cache_read, cache_write, output_text, reasoning, logged_cost_usd]`, where `cube_row` indexes the daily row that holds its dimensions.
