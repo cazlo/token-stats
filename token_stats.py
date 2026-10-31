@@ -27,6 +27,7 @@ from concurrent.futures import ProcessPoolExecutor
 import datetime as dt
 import errno
 import glob
+import hashlib
 from http import HTTPStatus
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 import json
@@ -55,11 +56,13 @@ BILLING_OVERRIDES_PATH = DATA_DIR / "billing_overrides.json"
 LOCAL_CONFIG_PATH = DATA_DIR / "local_config.json"
 SERVER_PID_PATH = DATA_DIR / "server.pid"
 WEB_DATA_JS_PATH = WEB_DIR / "data.js"
+SESSION_DETAIL_DIR = WEB_DIR / "sessions"
+SESSION_DETAIL_MANIFEST_PATH = DATA_DIR / "session_details_manifest.json"
 
 HOME = Path.home()
 LOCAL_TZ = dt.datetime.now().astimezone().tzinfo
 
-CACHE_SCHEMA_VERSION = "7"
+CACHE_SCHEMA_VERSION = "8"
 EXTRACT_LOCK = threading.Lock()
 _LOCAL_CFG_CACHE: tuple[int, dict[str, Any]] | None = None
 
@@ -163,6 +166,33 @@ def iso_to_local_hour_key(iso_str: str | None) -> str:
         except ValueError:
             return s[:10]
     return "unknown"
+
+
+def to_epoch_ms(ts: Any) -> int:
+    """Epoch milliseconds from an epoch (s or ms) number or an ISO timestamp; 0 when unknown."""
+    if ts is None or ts == "":
+        return 0
+    if isinstance(ts, (int, float)):
+        if ts <= 0:
+            return 0
+        return int(ts if ts > 1e11 else ts * 1000)
+    s = str(ts).strip()
+    if s.replace(".", "", 1).isdigit():
+        return to_epoch_ms(float(s))
+    try:
+        if s.endswith("Z"):
+            s = s[:-1] + "+00:00"
+        parsed = dt.datetime.fromisoformat(s)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=LOCAL_TZ)
+        return int(parsed.timestamp() * 1000)
+    except (ValueError, OverflowError, OSError):
+        return 0
+
+
+def new_timelines() -> dict[str, dict[str, Any]]:
+    """Per-session call timelines: {session_id: {"parent": parent_session_id, "calls": [[ms, model, inp, cr, cw, out, reas, cost], ...]}}."""
+    return defaultdict(lambda: {"parent": "", "calls": []})
 
 
 def hour_key_date(key: str) -> str:
@@ -622,6 +652,7 @@ def extract_claude(cache_con: sqlite3.Connection, pool: ProcessPoolExecutor | No
                 "cwd": payload.get("cwd") or "",
                 "is_sub": payload.get("is_sub", False),
                 "max_ts": payload.get("max_ts") or "",
+                "root": payload.get("root_session_id") or sid,
             }
         else:
             if not session_meta[sid]["title"] and payload.get("title"):
@@ -643,6 +674,7 @@ def extract_claude(cache_con: sqlite3.Connection, pool: ProcessPoolExecutor | No
     max_live_date = "0000-00-00"
     project_raw_paths: dict[str, set[str]] = defaultdict(set)
 
+    timelines = new_timelines()
     for sid, rec in global_calls.values():
         model_raw, ts, cwd, actor, inp, cr, cw, out_txt, reas = rec[:9]
         hour_key = iso_to_local_hour_key(ts)
@@ -665,6 +697,7 @@ def extract_claude(cache_con: sqlite3.Connection, pool: ProcessPoolExecutor | No
         b[3] += cw
         b[4] += out_txt
         b[5] += reas
+        timelines[sid]["calls"].append([to_epoch_ms(ts), model, inp, cr, cw, out_txt, reas, 0.0])
 
         s = sess_acc.get(sid)
         if s is None:
@@ -701,6 +734,10 @@ def extract_claude(cache_con: sqlite3.Connection, pool: ProcessPoolExecutor | No
         s["cache_write"] += cw
         s["output_text"] += out_txt
         s["reasoning"] += reas
+
+    for tl_sid, tl in timelines.items():
+        root = (session_meta.get(tl_sid) or {}).get("root") or tl_sid
+        tl["parent"] = root if root != tl_sid else ""
 
     for s in sess_acc.values():
         dom_mp = max(s["_mp_toks"].items(), key=lambda kv: kv[1])[0]
@@ -813,6 +850,7 @@ def extract_claude(cache_con: sqlite3.Connection, pool: ProcessPoolExecutor | No
     return {
         "cube": cube_acc,
         "sessions": list(sess_acc.values()),
+        "timelines": timelines,
         "project_paths": project_raw_paths,
         "billing_meta": claude_billing_meta,
         "health": {
@@ -976,6 +1014,7 @@ def _parse_codex_rollout(path: str) -> dict[str, Any]:
                                 l_reas,
                                 l_tot,
                                 is_comp_base,
+                                str(ev.get("timestamp") or ""),
                             ]
                         )
                     except Exception:
@@ -1191,6 +1230,7 @@ def extract_codex(cache_con: sqlite3.Connection, pool: ProcessPoolExecutor | Non
     )
 
     seen_cum: set[tuple[int, int, int, int, int, int]] = set()
+    timelines = new_timelines()
     cube_acc: dict[tuple[str, str, str, str, str, str, int], list[float]] = defaultdict(
         lambda: [0, 0, 0, 0, 0, 0, 0.0]
     )
@@ -1216,6 +1256,8 @@ def extract_codex(cache_con: sqlite3.Connection, pool: ProcessPoolExecutor | Non
             _thread_source,
             _parent_id,
         ) = row
+        tl_meta = ((file_payloads.get(thread_files.get(tid, "")) or {}).get("meta")) or {}
+        tl_parent = str(_parent_id or tl_meta.get("parent_thread_id") or tl_meta.get("forked_from_id") or "")
 
         actual = thread_files.get(tid)
         payload = file_payloads.get(actual) if actual else None
@@ -1251,7 +1293,8 @@ def extract_codex(cache_con: sqlite3.Connection, pool: ProcessPoolExecutor | Non
                     l_reas,
                     l_tot,
                     is_comp_base,
-                ) = ev
+                ) = ev[:15]
+                ev_ts = ev[15] if len(ev) > 15 else ""
                 cum6 = (c_in, c_cr, c_cw, c_out, c_reas, c_tot)
 
                 # Skip inherited parent prefix turns or compaction header baseline records
@@ -1299,6 +1342,9 @@ def extract_codex(cache_con: sqlite3.Connection, pool: ProcessPoolExecutor | Non
                 b[3] += d_cw
                 b[4] += out_txt
                 b[5] += d_reas
+                tl = timelines[tid]
+                tl["parent"] = tl_parent
+                tl["calls"].append([to_epoch_ms(ev_ts), model_id, uncached_in, d_cr, d_cw, out_txt, d_reas, 0.0])
 
                 mp = (model_id, provider)
                 mp_toks[mp] += turn_sum
@@ -1497,6 +1543,7 @@ def extract_codex(cache_con: sqlite3.Connection, pool: ProcessPoolExecutor | Non
     return {
         "cube": cube_acc,
         "sessions": sessions_out,
+        "timelines": timelines,
         "project_paths": project_raw_paths,
         "codex_wallet": codex_wallet,
         "health": {
@@ -1548,7 +1595,8 @@ def extract_opencode(cache_con: sqlite3.Connection) -> dict[str, Any]:
             cw INTEGER NOT NULL,
             out_txt INTEGER NOT NULL,
             reas INTEGER NOT NULL,
-            cost REAL NOT NULL
+            cost REAL NOT NULL,
+            ts_ms INTEGER NOT NULL DEFAULT 0
         );
         CREATE INDEX IF NOT EXISTS opencode_msg_cache_sess_idx ON opencode_msg_cache(session_id);
         """
@@ -1682,6 +1730,7 @@ def extract_opencode(cache_con: sqlite3.Connection) -> dict[str, Any]:
                         out_txt,
                         reas,
                         c_usd,
+                        to_epoch_ms(t_created),
                     )
                 )
 
@@ -1726,6 +1775,7 @@ def extract_opencode(cache_con: sqlite3.Connection) -> dict[str, Any]:
                         out_i,
                         reas_i,
                         cost_f,
+                        to_epoch_ms(t_created),
                     )
                 )
 
@@ -1733,8 +1783,8 @@ def extract_opencode(cache_con: sqlite3.Connection) -> dict[str, Any]:
             cache_con.executemany(
                 """
                 INSERT OR REPLACE INTO opencode_msg_cache
-                (msg_id, session_id, date_str, model_id, provider_id, inp, cr, cw, out_txt, reas, cost)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                (msg_id, session_id, date_str, model_id, provider_id, inp, cr, cw, out_txt, reas, cost, ts_ms)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 msg_inserts,
             )
@@ -1755,8 +1805,9 @@ def extract_opencode(cache_con: sqlite3.Connection) -> dict[str, Any]:
     min_date, max_date = "9999-99-99", "0000-00-00"
     total_msgs = 0
 
-    for sid, d_str, m_id, p_id, inp, cr, cw, out_txt, reas, cost in cache_con.execute(
-        "SELECT session_id, date_str, model_id, provider_id, inp, cr, cw, out_txt, reas, cost FROM opencode_msg_cache"
+    timelines = new_timelines()
+    for sid, d_str, m_id, p_id, inp, cr, cw, out_txt, reas, cost, ts_ms in cache_con.execute(
+        "SELECT session_id, date_str, model_id, provider_id, inp, cr, cw, out_txt, reas, cost, ts_ms FROM opencode_msg_cache"
     ):
         meta = sess_meta.get(sid)
         if meta is None:
@@ -1774,6 +1825,9 @@ def extract_opencode(cache_con: sqlite3.Connection) -> dict[str, Any]:
             max_date = max(max_date, eff_date)
 
         key = (eff_key, "OpenCode", provider, model, proj, actor, 0)
+        tl = timelines[sid]
+        tl["parent"] = meta.get("parent_id") or ""
+        tl["calls"].append([int(ts_ms or 0), model, inp, cr, cw, out_txt, reas, float(cost or 0.0)])
         b = cube_acc[key]
         b[0] += 1
         b[1] += inp
@@ -1902,6 +1956,7 @@ def extract_opencode(cache_con: sqlite3.Connection) -> dict[str, Any]:
     return {
         "cube": cube_acc,
         "sessions": sessions_out,
+        "timelines": timelines,
         "project_paths": project_raw_paths,
         "opencode_billing": {
             "promo_providers": sorted(promo_provs),
@@ -2336,6 +2391,7 @@ def extract_antigravity(cache_con: sqlite3.Connection, pool: ProcessPoolExecutor
     )
     sessions_out: list[dict[str, Any]] = []
     project_raw_paths: dict[str, set[str]] = defaultdict(set)
+    timelines = new_timelines()
     total_steps = 0
     min_date, max_date = "9999-99-99", "0000-00-00"
 
@@ -2365,6 +2421,9 @@ def extract_antigravity(cache_con: sqlite3.Connection, pool: ProcessPoolExecutor
 
             model, provider = normalize_model_and_provider(raw_m, None, "Antigravity")
             key = (eff_key, "Antigravity", provider, model, proj, actor, 0)
+            tl = timelines[cid]
+            tl["parent"] = meta.get("parent_cid") or payload.get("parent_cid") or ""
+            tl["calls"].append([to_epoch_ms(ts_val), model, inp, cr, cw, out_txt, reas, 0.0])
             b = cube_acc[key]
             b[0] += 1
             b[1] += inp
@@ -2419,6 +2478,7 @@ def extract_antigravity(cache_con: sqlite3.Connection, pool: ProcessPoolExecutor
     return {
         "cube": cube_acc,
         "sessions": sessions_out,
+        "timelines": timelines,
         "project_paths": project_raw_paths,
         "health": {
             "harness": "Antigravity",
@@ -2867,6 +2927,138 @@ def build_billing_summary(
     }
 
 
+def _session_detail_id(harness: str, root_id: str) -> str:
+    return hashlib.sha1(f"{harness}\x00{root_id}".encode("utf-8")).hexdigest()[:16]
+
+
+def build_session_details(
+    results: list[dict[str, Any]],
+    all_sessions: list[dict[str, Any]],
+    default_rates: dict[str, Any],
+) -> dict[str, Any]:
+    """
+    Group every session with its subagent / forked / auto-review descendants and write one
+    `web/sessions/<id>.js` per group (a per-call timeline the session page loads via <script>, so
+    it also works over file://). Sessions get a `detail` id pointing at their group's file.
+    Unchanged groups are not rewritten; files for groups that disappeared are removed.
+    """
+    sess_by_key: dict[tuple[str, str], dict[str, Any]] = {(s["harness"], s["id"]): s for s in all_sessions}
+    groups: dict[tuple[str, str], list[str]] = defaultdict(list)
+    tl_by_key: dict[tuple[str, str], dict[str, Any]] = {}
+
+    for res in results:
+        tls = res.get("timelines") or {}
+        harness = (res.get("health") or {}).get("harness") or ""
+        known = set(tls.keys())
+
+        def root_of(sid: str) -> str:
+            seen = {sid}
+            cur = sid
+            while True:
+                par = (tls.get(cur) or {}).get("parent") or ""
+                if not par or par in seen or (par not in known and (harness, par) not in sess_by_key):
+                    return cur
+                seen.add(par)
+                cur = par
+
+        for sid, tl in tls.items():
+            if not tl.get("calls"):
+                continue
+            tl_by_key[(harness, sid)] = tl
+            groups[(harness, root_of(sid))].append(sid)
+
+    SESSION_DETAIL_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        manifest = json.loads(SESSION_DETAIL_MANIFEST_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        manifest = {}
+    new_manifest: dict[str, str] = {}
+    written = 0
+    total_calls = 0
+
+    for (harness, root), members in sorted(groups.items()):
+        detail_id = _session_detail_id(harness, root)
+        calls_all: list[tuple[int, int, list[Any]]] = []
+        agent_first: dict[str, int] = {}
+        untimed = 0
+        for sid in members:
+            for c in tl_by_key[(harness, sid)]["calls"]:
+                if c[0] > 0:
+                    calls_all.append((c[0], 0, [sid, *c]))
+                    agent_first[sid] = min(agent_first.get(sid, c[0]), c[0])
+                else:
+                    untimed += 1
+        if not calls_all:
+            continue
+        # Root first, then descendants in order of their first call
+        order = sorted(members, key=lambda m: (m != root, agent_first.get(m, 1 << 62), m))
+        order = [m for m in order if m in agent_first]
+        agent_idx = {sid: i for i, sid in enumerate(order)}
+        calls_all.sort(key=lambda t: (t[0], agent_idx[t[2][0]]))
+        t0 = calls_all[0][0]
+        models: list[str] = []
+        model_idx: dict[str, int] = {}
+        rows = []
+        for ms, _o, (sid, _ms, model, inp, cr, cw, out_txt, reas, cost) in calls_all:
+            if model not in model_idx:
+                model_idx[model] = len(models)
+                models.append(model)
+            rows.append([ms - t0, agent_idx[sid], model_idx[model], inp, cr, cw, out_txt, reas, round(float(cost), 6)])
+        total_calls += len(rows)
+
+        agents = []
+        for sid in order:
+            s = sess_by_key.get((harness, sid)) or {}
+            tl = tl_by_key[(harness, sid)]
+            agents.append(
+                {
+                    "id": sid,
+                    "parent": tl.get("parent") or "",
+                    "title": s.get("title") or sid,
+                    "actor": s.get("actor") or ("main" if sid == root else "subagent"),
+                    "model": s.get("model") or "",
+                    "project": s.get("project") or "",
+                }
+            )
+        root_s = sess_by_key.get((harness, root)) or {}
+        detail = {
+            "id": detail_id,
+            "harness": harness,
+            "root": root,
+            "title": root_s.get("title") or root,
+            "project": root_s.get("project") or (agents[0]["project"] if agents else ""),
+            "t0": t0,
+            "untimed_calls": untimed,
+            "models": models,
+            "rates": {m: default_rates.get(m) for m in models if default_rates.get(m)},
+            "agents": agents,
+            "call_columns": ["dt_ms", "agent", "model", "input_uncached", "cache_read", "cache_write", "output_text", "reasoning", "logged_cost_usd"],
+            "calls": rows,
+        }
+        body = json.dumps(detail, separators=(",", ":"))
+        digest = hashlib.sha1(body.encode("utf-8")).hexdigest()
+        new_manifest[detail_id] = digest
+        out_path = SESSION_DETAIL_DIR / f"{detail_id}.js"
+        if manifest.get(detail_id) != digest or not out_path.exists():
+            _atomic_write_text(out_path, f"window.__TOKEN_SESSION__ = {body};\n")
+            written += 1
+        for sid in members:
+            s = sess_by_key.get((harness, sid))
+            if s is not None:
+                s["detail"] = detail_id
+
+    removed = 0
+    for f in SESSION_DETAIL_DIR.glob("*.js"):
+        if f.stem not in new_manifest:
+            try:
+                f.unlink()
+                removed += 1
+            except OSError:
+                pass
+    _atomic_write_text(SESSION_DETAIL_MANIFEST_PATH, json.dumps(new_manifest, separators=(",", ":")))
+    return {"groups": len(new_manifest), "written": written, "removed": removed, "calls": total_calls}
+
+
 def extract_all(rebuild: bool = False) -> dict[str, Any]:
     with EXTRACT_LOCK:
         return _extract_all_locked(rebuild=rebuild)
@@ -2991,12 +3183,16 @@ def _extract_all_locked(rebuild: bool = False) -> dict[str, Any]:
         m: default_model_pricing(m, prov) for m, prov in sorted(distinct_models.items())
     }
     billing_summary = build_billing_summary(claude_res, codex_res, oc_res, cube_rows, default_rates)
+    session_detail_stats = build_session_details(
+        [claude_res, codex_res, oc_res, ag_res], all_sessions, default_rates
+    )
 
     total_ms = round((time.time() - t_start) * 1000, 1)
     payload = {
         "generated_at": dt.datetime.now().astimezone().isoformat(timespec="seconds"),
         "hostname": os.uname().nodename,
         "extraction_ms": total_ms,
+        "session_details": session_detail_stats,
         "total_sessions_indexed": len(all_sessions),
         "cube_columns": [
             "date",

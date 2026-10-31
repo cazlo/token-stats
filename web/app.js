@@ -1,85 +1,8 @@
 (() => {
   "use strict";
 
-  // Theme-aware palettes. Harness / provider hues follow vendor branding (Claude = clay orange,
-  // OpenAI / Codex = blue, Google / Antigravity = green) and were checked for normal-vision and
-  // colour-blind (protan/deutan) separation against each theme's card surface.
-  // `series` is the categorical set for open-ended dimensions (projects, models): 10 hues that are
-  // mutually distinct across ALL pairs (not only neighbours), assigned per entity so no two series
-  // visible in the same chart ever share a colour. "Other" is always the neutral slate.
-  const PALETTES = {
-    dark: {
-      harness: {
-        "Claude Code": "#e07a55",
-        "Codex": "#5a95f5",
-        "OpenCode": "#c94fa8",
-        "Antigravity": "#86e3a5",
-      },
-      provider: {
-        "Anthropic": "#e07a55",
-        "OpenAI": "#5a95f5",
-        "Google": "#86e3a5",
-        "Local / Self-Hosted GPU": "#c94fa8",
-        "Other": "#94a3b8",
-      },
-      actor: {
-        "subagent": "#a78bfa",
-        "main": "#38bdf8",
-        "auto_review": "#fbbf24",
-      },
-      bucket: {
-        "Cache Read": "#475569",
-        "Cache Write": "#f59e0b",
-        "Uncached Input": "#38bdf8",
-        "Text Output": "#34d399",
-        "Reasoning": "#f472b6",
-        "Subscriptions": "#38bdf8",
-        "Overages / Credits": "#f59e0b",
-      },
-      series: [
-        "#60d0fe", "#fb4c10", "#92e62c", "#9563fe", "#c5ad4c",
-        "#d57ba0", "#36d4a6", "#759ae6", "#c33dbd", "#009c1e",
-      ],
-      other: "#64748b",
-      // GitHub-style activity ramp: empty cell + 4 intensity steps (one hue, dim -> bright)
-      heat: ["#1a2131", "#173f73", "#1f62b3", "#3987e5", "#9ec5f4"],
-    },
-    light: {
-      harness: {
-        "Claude Code": "#e0784a",
-        "Codex": "#2563eb",
-        "OpenCode": "#b8389a",
-        "Antigravity": "#0f6b2f",
-      },
-      provider: {
-        "Anthropic": "#e0784a",
-        "OpenAI": "#2563eb",
-        "Google": "#0f6b2f",
-        "Local / Self-Hosted GPU": "#b8389a",
-        "Other": "#64748b",
-      },
-      actor: {
-        "subagent": "#7c3aed",
-        "main": "#0284c7",
-        "auto_review": "#c98500",
-      },
-      bucket: {
-        "Cache Read": "#94a3b8",
-        "Cache Write": "#d97706",
-        "Uncached Input": "#0284c7",
-        "Text Output": "#059669",
-        "Reasoning": "#db2777",
-        "Subscriptions": "#0284c7",
-        "Overages / Credits": "#d97706",
-      },
-      series: [
-        "#0d76ad", "#cd7d09", "#5ccc22", "#9754ed", "#b24358",
-        "#026812", "#ef74fb", "#3f34cb", "#fb5b7b", "#851690",
-      ],
-      other: "#94a3b8",
-      heat: ["#eef2f8", "#b7d3f6", "#6da7ec", "#2a78d6", "#104281"],
-    },
-  };
+  // Palettes and formatting helpers are shared with session.html via common.js
+  const PALETTES = window.TokenObs.PALETTES;
   let PALETTE = PALETTES.dark;
 
   function applyThemePalette(theme) {
@@ -115,9 +38,8 @@
   const C_COST = 14;
   const C_HOUR = 15; // only present on hourly rows built from rawData.cube_hourly
 
-  const STORAGE_RATES_KEY = "token_obs_rates_v1";
+  const { STORAGE_RATES_KEY, STORAGE_THEME_KEY } = window.TokenObs;
   const STORAGE_BILLING_KEY = "token_obs_billing_v1";
-  const STORAGE_THEME_KEY = "token_obs_theme_v1";
 
   let rawData = window.__TOKEN_STATS__ || null;
   let customRates = loadSavedRates();
@@ -160,21 +82,7 @@
   // Formatting & Math Helpers
   // -------------------------------------------------------------------------
 
-  function fmtTok(n) {
-    const abs = Math.abs(n || 0);
-    if (abs >= 1e9) return (n / 1e9).toFixed(2) + "B";
-    if (abs >= 1e6) return (n / 1e6).toFixed(2) + "M";
-    if (abs >= 1e3) return (n / 1e3).toFixed(1) + "K";
-    return Math.round(n || 0).toLocaleString();
-  }
-
-  function fmtUsd(n) {
-    const v = Number(n || 0);
-    if (v >= 1000) return "$" + v.toLocaleString(undefined, { maximumFractionDigits: 0 });
-    if (v >= 10) return "$" + v.toFixed(2);
-    if (v > 0 && v < 0.01) return "<$0.01";
-    return "$" + v.toFixed(2);
-  }
+  const { fmtTok, fmtUsd, esc } = window.TokenObs;
 
   function fmtMetric(val, metric = state.metric) {
     return metric === "est_cost" || metric === "paid_cost" ? fmtUsd(val) : fmtTok(val);
@@ -189,14 +97,6 @@
   function fmtPct(num, den) {
     if (!den || den <= 0) return "0.0%";
     return ((num / den) * 100).toFixed(1) + "%";
-  }
-
-  function esc(str) {
-    return String(str ?? "")
-      .replace(/&/g, "&amp;")
-      .replace(/</g, "&lt;")
-      .replace(/>/g, "&gt;")
-      .replace(/"/g, "&quot;");
   }
 
   // Stable, collision-free colours for open-ended dimensions (project, model, ...). Each entity keeps
@@ -2311,7 +2211,7 @@
 
     sortAggs(matched, "sessions");
     const shown = matched.slice(0, 60);
-    sub.textContent = `Showing top ${shown.length.toLocaleString()} of ${matched.length.toLocaleString()} sessions matching active filters`;
+    sub.textContent = `Showing top ${shown.length.toLocaleString()} of ${matched.length.toLocaleString()} sessions matching active filters · Click a title or Timeline ↗ to see a session's calls and subagents over time`;
 
     const rowsHtml = shown
       .map((s) => {
@@ -2324,13 +2224,22 @@
             <td><span class="badge"><span class="dot" style="background:${aCol}"></span>${esc(s.actor)}</span></td>
             <td><strong>${esc(s.project)}</strong></td>
             <td class="mono" style="font-size:11.5px">${esc(s.model)}</td>
-            <td style="max-width:340px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${esc(s.title)}">${esc(s.title)}</td>
+            <td style="max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${esc(s.title)}">${
+              s.detail
+                ? `<a class="sess-link" href="./session.html?d=${encodeURIComponent(s.detail)}&s=${encodeURIComponent(s.id)}" target="_blank" rel="noopener" title="Open the call-by-call timeline for this session">${esc(s.title)}</a>`
+                : esc(s.title)
+            }</td>
             <td class="right num">${s.calls.toLocaleString()}</td>
             <td class="right num">${fmtTok(s.active)}</td>
             <td class="right num">${fmtTok(s.cr)}</td>
             <td class="right num">${fmtTok(s.generated)}</td>
             <td class="right num"><strong>${fmtTok(s.total)}</strong></td>
             <td class="right num">${fmtUsd(s.estCost)}</td>
+            <td class="right">${
+              s.detail
+                ? `<a class="tl-btn" href="./session.html?d=${encodeURIComponent(s.detail)}&s=${encodeURIComponent(s.id)}" target="_blank" rel="noopener" title="Open the call-by-call timeline for this session">Timeline ↗</a>`
+                : ""
+            }</td>
           </tr>
         `;
       })
@@ -2352,9 +2261,10 @@
             ${thHtml("sessions", "generated", "Out+Reason")}
             ${thHtml("sessions", "total", "Total")}
             ${thHtml("sessions", "estCost", "Est. $")}
+            <th></th>
           </tr>
         </thead>
-        <tbody>${rowsHtml || '<tr><td colspan="12" style="color:var(--text-muted)">No matching sessions</td></tr>'}</tbody>
+        <tbody>${rowsHtml || '<tr><td colspan="13" style="color:var(--text-muted)">No matching sessions</td></tr>'}</tbody>
       </table>
     `;
     bindSortHeaders(wrap);

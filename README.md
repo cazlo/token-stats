@@ -68,3 +68,14 @@ Different providers report token fields differently (e.g., Codex `input_tokens` 
 - **Range selection:** the Range bar has `1d`, `3d`, `7d`, `14d`, `30d` and month presets (counted back from the latest day with data). On the velocity chart and the calendar, click a bar/day to select it, or press and drag across bars/days to select a span; everything on the page filters to that range. In the hourly view a drag selects exact hours (e.g. `2026-10-29 15:00 → 2026-10-30 10:59`), shown as a ⏱ pill next to the date pickers; its ✕ widens back to whole days, and clicking an hourly bar opens its whole day. Session counts stay day-level, since sessions only carry a date.
 
 The payload carries a compact `cube_hourly` table alongside the daily `cube`: each row is `[cube_row, hour, calls, input_uncached, cache_read, cache_write, output_text, reasoning, logged_cost_usd]`, where `cube_row` indexes the daily row that holds its dimensions.
+
+## Session Timelines
+
+Every session in **Heavyweight Sessions & Subagent Runs** links to `session.html`, a call-by-call view of that session together with its subagents (and Codex forks / auto-reviews):
+
+- **Token Burn Over Time** — stacked by agent, token type or model, per interval or cumulative.
+- **Agent Lanes** — when the main session and each subagent were active, with dashed connectors where a subagent was spawned.
+- **Context Size per Call** — prompt size on every call per agent, with ▼ marking sharp drops (usually compactions).
+- **Agents** table — calls, tokens, est. $, peak context and drops per agent for the visible window.
+
+Drag across any chart to zoom all of them to a time window; click a lane, legend entry or table row to focus one agent. Each session group is written to git-ignored `web/sessions/<id>.js` during extraction (unchanged files are not rewritten), so the page also works offline via `file://`.
