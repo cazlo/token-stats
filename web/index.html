@@ -53,6 +53,10 @@
         <input type="date" id="date-from" aria-label="Start date" />
         <span style="color: var(--text-dim)">→</span>
         <input type="date" id="date-to" aria-label="End date" />
+        <span class="hour-window" id="hour-window" hidden title="Hour-level range: the first and last days are cut to these local times">
+          ⏱ <span data-hour-label></span>
+          <button id="btn-clear-hours" title="Widen to whole days">✕</button>
+        </span>
       </div>
 
       <div class="control-group">

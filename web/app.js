@@ -127,6 +127,10 @@
   const state = {
     dateFrom: "",
     dateTo: "",
+    // Optional hour-level edges of the date range: the range starts at dateFrom hourFrom:00 and
+    // ends at dateTo hourTo:59 (local time). 0 / 23 means whole days.
+    hourFrom: 0,
+    hourTo: 23,
     rangePreset: "all",
     metric: "total", // total | active | generated | est_cost
     includeArchived: true,
@@ -687,9 +691,44 @@
     return true;
   }
 
+  function hourWindowActive() {
+    return state.hourFrom > 0 || state.hourTo < 23;
+  }
+
+  function resetHourWindow() {
+    state.hourFrom = 0;
+    state.hourTo = 23;
+  }
+
+  // Partial first/last days of an hour-level range can only be counted from hourly rows; whole
+  // days in between keep using the daily cube.
+  function isEdgeDay(d) {
+    return (d === state.dateFrom && state.hourFrom > 0) || (d === state.dateTo && state.hourTo < 23);
+  }
+
+  // Rows every panel aggregates over: the daily cube, plus hourly rows for partial edge days when
+  // an hour-level range is active (rowMatches then drops the daily rows for those days).
+  function scopeRows() {
+    if (!rawData || !rawData.cube) return [];
+    if (!hourWindowActive()) return rawData.cube;
+    return rawData.cube.concat(hourlyRows.filter((r) => isEdgeDay(r[C_DATE])));
+  }
+
+  function hourMatches(r) {
+    if (!hourWindowActive()) return true;
+    const d = r[C_DATE];
+    if (!isEdgeDay(d)) return true;
+    if (r.length <= C_HOUR) return false; // daily row (or no hour data) on a partial day
+    const h = r[C_HOUR];
+    if (d === state.dateFrom && h < state.hourFrom) return false;
+    if (d === state.dateTo && h > state.hourTo) return false;
+    return true;
+  }
+
   function rowMatches(r, ignoreDim = null) {
     if (!state.includeArchived && r[C_ARCHIVED]) return false;
     if (!dateMatches(r[C_DATE])) return false;
+    if (!hourMatches(r)) return false;
     const f = state.filters;
     if (ignoreDim !== "harness" && f.harness && r[C_HARNESS] !== f.harness) return false;
     if (ignoreDim !== "provider" && f.provider && r[C_PROVIDER] !== f.provider) return false;
@@ -723,6 +762,7 @@
 
   function applyRangePreset(preset) {
     state.rangePreset = preset;
+    resetHourWindow();
     const [minD, maxD] = getMinMaxDates(rawData.cube);
     if (preset === "all") {
       state.dateFrom = minD;
@@ -751,6 +791,10 @@
   // Rendering Sections
   // -------------------------------------------------------------------------
 
+  function fmtHour(h, end = false) {
+    return `${String(h).padStart(2, "0")}:${end ? "59" : "00"}`;
+  }
+
   function renderHeaderAndChips(matchedSessionCount) {
     const sub = document.getElementById("meta-subtitle");
     const genDate = rawData.generated_at ? rawData.generated_at.replace("T", " ") : "";
@@ -769,8 +813,16 @@
         `<span class="filter-chip">${esc(dim)}: <strong>${esc(val)}</strong><button data-clear-dim="${esc(dim)}" title="Remove filter">✕</button></span>`
       );
     }
+    const hourPill = document.getElementById("hour-window");
+    if (hourPill) {
+      hourPill.hidden = !hourWindowActive();
+      const lbl = hourPill.querySelector("[data-hour-label]");
+      if (lbl) lbl.textContent = `${fmtHour(state.hourFrom)} → ${fmtHour(state.hourTo, true)}`;
+    }
     if (state.rangePreset !== "all" && (state.dateFrom || state.dateTo)) {
-      const dLabel = `${state.dateFrom || "…"} → ${state.dateTo || "…"}`;
+      const dLabel = hourWindowActive()
+        ? `${state.dateFrom} ${fmtHour(state.hourFrom)} → ${state.dateTo} ${fmtHour(state.hourTo, true)}`
+        : `${state.dateFrom || "…"} → ${state.dateTo || "…"}`;
       chips.push(
         `<span class="filter-chip">date: <strong>${esc(dLabel)}</strong><button data-clear-date="1" title="Reset date range">✕</button></span>`
       );
@@ -881,7 +933,7 @@
     const forensicsWrap = document.getElementById("billing-forensics-wrap");
     if (!mixBar || !harnessWrap || !forensicsWrap || !rawData) return;
 
-    const dimRows = rawData.cube.filter((r) => rowMatches(r, "harness"));
+    const dimRows = scopeRows().filter((r) => rowMatches(r, "harness"));
     const hasSubDim = Boolean(
       state.filters.provider || state.filters.model || state.filters.project || state.filters.actor
     );
@@ -1136,7 +1188,7 @@
     if (subEl) {
       const hint =
         grain === "hour"
-          ? "Local-time hourly buckets · Hover a legend item to highlight it, click to filter · Click a bar, or drag across bars, to select days"
+          ? "Local-time hourly buckets · Hover a legend item to highlight it, click to filter · Drag across bars to select exact hours; click a bar to open its whole day"
           : "Hover a legend item to highlight it, click to filter · Click a bar, or drag across bars, to select a date range";
       subEl.textContent = [...notes, hint].join(" · ");
     }
@@ -1242,8 +1294,12 @@
         // Whole local days, midnight to 23:00, so a single isolated day always shows 24 bars
         let cur = Date.UTC(sy, sm - 1, sd, 0);
         const end = Date.UTC(ey, em - 1, ed, 23);
+        const winLo = hourWindowActive() ? `${state.dateFrom}T${pad2(state.hourFrom)}` : "";
+        const winHi = hourWindowActive() ? `${state.dateTo}T${pad2(state.hourTo)}` : "";
         while (cur <= end && periods.length < 24 * (HOURLY_MAX_DAYS + 1)) {
-          periods.push(new Date(cur).toISOString().slice(0, 13));
+          const key = new Date(cur).toISOString().slice(0, 13);
+          // With an hour-level range, only draw the selected hours
+          if (!winLo || (key >= winLo && key <= winHi)) periods.push(key);
           cur += 3600000;
         }
       } else {
@@ -1394,8 +1450,8 @@
       });
     });
 
-    // Click a bar to isolate it, or press and drag left/right to select a span of bars.
-    // Date filters are day-granular, so hourly selections snap to whole days.
+    // Click a bar to isolate it (an hourly bar drills into its whole day), or press and drag
+    // left/right to select a span of bars; in the hourly view a drag selects exact hours.
     const selRect = svg.querySelector(".sel-rect");
     const periodStart = (p) => p.slice(0, 10);
     const periodEnd = (p) => (grain === "week" ? addDaysISO(p, 6) : p.slice(0, 10));
@@ -1419,12 +1475,19 @@
       const from = periodStart(periodData[lo].period);
       const to = periodEnd(periodData[hi].period);
       const days = dateSpanDays(from, to) + 1;
-      const span =
-        grain === "hour"
-          ? `${hi - lo + 1} h → ${days} day${days === 1 ? "" : "s"}`
-          : `${days} day${days === 1 ? "" : "s"}`;
+      let title = `${from}${to !== from ? " → " + to : ""}`;
+      let span = `${days} day${days === 1 ? "" : "s"}`;
+      if (grain === "hour") {
+        const hLo = Number(periodData[lo].period.slice(11, 13));
+        const hHi = Number(periodData[hi].period.slice(11, 13));
+        title =
+          from === to
+            ? `${from} ${fmtHour(hLo)} → ${fmtHour(hHi, true)}`
+            : `${from} ${fmtHour(hLo)} → ${to} ${fmtHour(hHi, true)}`;
+        span = `${hi - lo + 1} hour${hi === lo ? "" : "s"}`;
+      }
       tooltip.innerHTML = `
-        <div class="tt-title"><span>${esc(from)}${to !== from ? " → " + esc(to) : ""}</span><span class="num">${fmtMetric(sum, metric)}</span></div>
+        <div class="tt-title"><span>${esc(title)}</span><span class="num">${fmtMetric(sum, metric)}</span></div>
         <div class="tt-row"><span>${esc(span)}</span><span>release to select</span></div>
       `;
       positionTooltip(tooltip, ev);
@@ -1456,10 +1519,17 @@
       if (!timelineDrag) return;
       const lo = Math.min(timelineDrag.start, timelineDrag.cur);
       const hi = Math.max(timelineDrag.start, timelineDrag.cur);
+      const moved = timelineDrag.moved;
       timelineDrag = null;
       tooltip.hidden = true;
       if (!periodData[lo] || !periodData[hi]) return;
-      isolateDates(periodStart(periodData[lo].period), periodEnd(periodData[hi].period));
+      const from = periodStart(periodData[lo].period);
+      const to = periodEnd(periodData[hi].period);
+      if (grain === "hour" && moved) {
+        isolateDates(from, to, Number(periodData[lo].period.slice(11, 13)), Number(periodData[hi].period.slice(11, 13)));
+      } else {
+        isolateDates(from, to);
+      }
     };
     svg.onpointercancel = () => {
       timelineDrag = null;
@@ -1519,11 +1589,13 @@
     tooltip.style.top = ty + "px";
   }
 
-  function isolateDates(from, to) {
+  function isolateDates(from, to, hourFrom = 0, hourTo = 23) {
     state.rangePreset = "custom";
     document.querySelectorAll("#range-presets .seg-btn").forEach((b) => b.classList.remove("active"));
     state.dateFrom = from;
     state.dateTo = to;
+    state.hourFrom = hourFrom;
+    state.hourTo = hourTo;
     document.getElementById("date-from").value = state.dateFrom;
     document.getElementById("date-to").value = state.dateTo;
     renderAll();
@@ -1584,7 +1656,7 @@
     const availW = Math.max(240, (wrap.clientWidth || 900) - labelW - 4);
     const cell = Math.max(10, Math.min(24, Math.floor(availW / weeks) - gap));
     const pitch = cell + gap;
-    const svgW = labelW + weeks * pitch;
+    const svgW = Math.max(labelW + weeks * pitch, labelW + 64); // room for a month label on narrow ranges
     const svgH = topH + 7 * pitch;
     const heat = PALETTE.heat;
 
@@ -2557,12 +2629,12 @@
   }
 
   function exportFilteredCsv() {
-    const rows = rawData.cube.filter((r) => rowMatches(r));
+    const rows = scopeRows().filter((r) => rowMatches(r));
     const header = [
       "date", "harness", "provider", "model", "project", "actor", "archived",
       "calls", "sessions", "input_uncached", "cache_read", "cache_write",
       "output_text", "reasoning", "total_tokens", "logged_cost_usd",
-      "paid_attributed_usd", "promo_absorbed_usd", "est_api_cost_usd",
+      "paid_attributed_usd", "promo_absorbed_usd", "est_api_cost_usd", "hour",
     ];
     const lines = [header.join(",")];
     for (const r of rows) {
@@ -2573,6 +2645,7 @@
         r[C_DATE], r[C_HARNESS], r[C_PROVIDER], r[C_MODEL], r[C_PROJECT], r[C_ACTOR], r[C_ARCHIVED],
         r[C_CALLS], r[C_SESSIONS], r[C_IN], r[C_CR], r[C_CW], r[C_OUT], r[C_REAS], tot,
         r[C_COST].toFixed(6), rb.paid.toFixed(6), rb.promo.toFixed(6), est.toFixed(6),
+        r.length > C_HOUR ? r[C_HOUR] : "",
       ].map(csvCell);
       lines.push(vals.join(","));
     }
@@ -2582,7 +2655,11 @@
     a.download = `token-observatory-${new Date().toISOString().slice(0, 10)}.csv`;
     a.click();
     URL.revokeObjectURL(a.href);
-    showToast(`Exported ${rows.length.toLocaleString()} daily cube rows to CSV.`);
+    showToast(
+      hourWindowActive()
+        ? `Exported ${rows.length.toLocaleString()} rows to CSV (partial first/last days as hourly rows).`
+        : `Exported ${rows.length.toLocaleString()} daily cube rows to CSV.`
+    );
   }
 
   async function refreshFromServer() {
@@ -2619,7 +2696,8 @@
   function renderAll() {
     if (!rawData || !rawData.cube) return;
     recomputeBillingAllocations();
-    const filteredRows = rawData.cube.filter((r) => rowMatches(r));
+    const baseRows = scopeRows();
+    const filteredRows = baseRows.filter((r) => rowMatches(r));
     const filteredHourly = hourlyRows.filter((r) => rowMatches(r));
     const grand = emptyAgg("grand");
     for (const r of filteredRows) addRowToAgg(grand, r);
@@ -2632,14 +2710,14 @@
     renderBillingPanel();
     renderTimeline(filteredRows, filteredHourly);
     renderActivityCalendar(filteredRows);
-    renderAnatomyAndRoles(grand, filteredRows, rawData.cube.filter((r) => rowMatches(r, "actor")), filteredHourly);
+    renderAnatomyAndRoles(grand, filteredRows, baseRows.filter((r) => rowMatches(r, "actor")), filteredHourly);
     renderCompactDimTable(
       "harness-table-wrap",
       "harness",
       "harness",
       C_HARNESS,
       PALETTE.harness,
-      rawData.cube.filter((r) => rowMatches(r, "harness"))
+      baseRows.filter((r) => rowMatches(r, "harness"))
     );
     renderCompactDimTable(
       "provider-table-wrap",
@@ -2647,10 +2725,10 @@
       "provider",
       C_PROVIDER,
       PALETTE.provider,
-      rawData.cube.filter((r) => rowMatches(r, "provider"))
+      baseRows.filter((r) => rowMatches(r, "provider"))
     );
-    renderModelTable(rawData.cube.filter((r) => rowMatches(r, "model")));
-    renderProjectTable(rawData.cube.filter((r) => rowMatches(r, "project")));
+    renderModelTable(baseRows.filter((r) => rowMatches(r, "model")));
+    renderProjectTable(baseRows.filter((r) => rowMatches(r, "project")));
     renderMatrix(filteredRows);
     renderSessions(matchedSessions);
     renderHealth();
@@ -2695,6 +2773,7 @@
         }
         state.dateFrom = df;
         state.dateTo = dt;
+        resetHourWindow();
         state.rangePreset = "custom";
         document.querySelectorAll("#range-presets .seg-btn").forEach((b) => b.classList.remove("active"));
         renderAll();
@@ -2876,12 +2955,20 @@
 
     window.addEventListener("pointerup", finishCalendarDrag);
 
+    const clearHours = document.getElementById("btn-clear-hours");
+    if (clearHours) {
+      clearHours.addEventListener("click", () => {
+        resetHourWindow();
+        renderAll();
+      });
+    }
+
     let resizeRaf = 0;
     window.addEventListener("resize", () => {
       cancelAnimationFrame(resizeRaf);
       resizeRaf = requestAnimationFrame(() => {
         if (!rawData) return;
-        const rows = rawData.cube.filter((r) => rowMatches(r));
+        const rows = scopeRows().filter((r) => rowMatches(r));
         renderTimeline(rows, hourlyRows.filter((r) => rowMatches(r)));
         renderActivityCalendar(rows);
       });

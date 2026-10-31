@@ -488,6 +488,29 @@ button.active, .seg-btn.active {
   touch-action: pan-y;
 }
 
+.hour-window {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 4px 3px 9px;
+  border: 1px solid var(--accent);
+  border-radius: 99px;
+  background: var(--accent-soft);
+  color: var(--text);
+  font-family: var(--mono);
+  font-size: 12px;
+}
+
+.hour-window[hidden] {
+  display: none;
+}
+
+.hour-window button {
+  padding: 1px 6px;
+  font-size: 11px;
+  border-radius: 99px;
+}
+
 .chart-svg .sel-rect {
   fill: var(--accent-soft);
   stroke: var(--accent);
