@@ -30,6 +30,7 @@
   let agentColor = [];
   let agentInTop = [];
   let agentParentIdx = [];
+  let agentModels = []; // per agent: [[model, calls], ...] over the whole session, most-used first
   let callEst = null; // Float64Array of est $ per call (recomputed when rates change)
   let brushing = false; // a drag-to-zoom is in progress
   let lastBrushAt = 0; // when the last drag-to-zoom finished (so it isn't also treated as a click)
@@ -229,6 +230,15 @@
     for (let i = 0; i < n; i++) {
       if (agentInTop[i]) agentColor[i] = PALETTE.series[slot++ % PALETTE.series.length];
     }
+
+    const modelCounts = [...Array(n)].map(() => new Map());
+    for (const c of D.calls) {
+      const m = modelCounts[c[K_AGENT]];
+      m.set(c[K_MODEL], (m.get(c[K_MODEL]) || 0) + 1);
+    }
+    agentModels = modelCounts.map((m) =>
+      [...m.entries()].sort((a, b) => b[1] - a[1]).map(([mi, cnt]) => [D.models[mi], cnt])
+    );
 
     const idxById = new Map(D.agents.map((a, i) => [a.id, i]));
     agentParentIdx = D.agents.map((a) => (a.parent && idxById.has(a.parent) ? idxById.get(a.parent) : -1));
@@ -660,6 +670,11 @@
         tooltip.innerHTML = `
           <div class="tt-title"><span><span class="swatch" style="background:${agentColor[i]};margin-right:6px;"></span>${esc(agentLabel(i, 44))}</span></div>
           <div class="tt-row"><span>Role</span><span>${esc(a.actor)}</span></div>
+          <div class="tt-row"><span>${agentModels[i].length > 1 ? "Models" : "Model"}</span><span class="mono" style="text-align:right">${
+            agentModels[i].length > 1
+              ? agentModels[i].map(([m, cnt]) => `${esc(m)} (${cnt})`).join("<br/>")
+              : esc((agentModels[i][0] || [a.model])[0])
+          }</span></div>
           <div class="tt-row"><span>Active</span><span class="num">${esc(fmtClock(f, true))} → ${esc(fmtClock(l, true))} (${esc(fmtDuration(l - f))})</span></div>
           ${i > 0 ? `<div class="tt-row"><span>Spawned by</span><span>${esc(parent)}</span></div>` : ""}
           <div class="tt-row"><span>Calls in window</span><span class="num">${s.calls.toLocaleString()}</span></div>
