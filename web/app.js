@@ -684,6 +684,17 @@
       end.setUTCDate(end.getUTCDate() - (days - 1));
       state.dateFrom = end.toISOString().slice(0, 10);
       state.dateTo = maxD;
+    } else if (preset.endsWith("m")) {
+      const monthsBack = parseInt(preset, 10);
+      const [y, m, d] = maxD.split("-").map(Number);
+      const totalMonths = y * 12 + (m - 1) - monthsBack;
+      const ty = Math.floor(totalMonths / 12);
+      const tm = ((totalMonths % 12) + 12) % 12;
+      const lastDay = new Date(Date.UTC(ty, tm + 1, 0)).getUTCDate();
+      const start = new Date(Date.UTC(ty, tm, Math.min(d, lastDay)));
+      start.setUTCDate(start.getUTCDate() + 1);
+      state.dateFrom = start.toISOString().slice(0, 10);
+      state.dateTo = maxD;
     } else if (/^\d{4}-\d{2}$/.test(preset)) {
       const [y, m] = preset.split("-").map(Number);
       const lastDay = new Date(Date.UTC(y, m, 0)).getUTCDate();

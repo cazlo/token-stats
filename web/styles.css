@@ -223,6 +223,7 @@ button.active, .seg-btn.active {
 
 .seg-group {
   display: inline-flex;
+  flex-wrap: wrap;
   background: var(--bg-subtle);
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
