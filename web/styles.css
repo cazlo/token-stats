@@ -17,14 +17,14 @@
   --c-codex: #5a95f5;
   --c-opencode: #c94fa8;
   --c-antigravity: #86e3a5;
-  --c-copilot: #2dd4bf;
+  --c-copilot: #f5b731;
 
   --c-anthropic: #e07a55;
   --c-openai: #5a95f5;
   --c-google: #86e3a5;
-  --c-xai: #facc15;
-  --c-moonshot: #38bdf8;
-  --c-microsoft: #a78bfa;
+  --c-xai: #fde047;
+  --c-moonshot: #22d3ee;
+  --c-microsoft: #3b4cca;
   --c-local-gpu: #c94fa8;
 
   /* Token bucket palette */
@@ -62,13 +62,13 @@
   --c-codex: #2563eb;
   --c-opencode: #b8389a;
   --c-antigravity: #0f6b2f;
-  --c-copilot: #0891b2;
+  --c-copilot: #ca8a04;
   --c-anthropic: #e0784a;
   --c-openai: #2563eb;
   --c-google: #0f6b2f;
   --c-xai: #ca8a04;
-  --c-moonshot: #0284c7;
-  --c-microsoft: #7c3aed;
+  --c-moonshot: #06b6d4;
+  --c-microsoft: #312e81;
   --c-local-gpu: #b8389a;
 }
 

@@ -247,13 +247,20 @@
     const ovArr = new Float64Array(n);
     const promoArr = new Float64Array(n);
     const bill = rawData.billing || {};
-    const promoProvs = new Set((bill.opencode_telemetry && bill.opencode_telemetry.promo_providers) || []);
+    const ot = bill.opencode_telemetry || {};
+    const promoProvs = new Set(ot.promo_providers || []);
+    const promoEnd = ot.promo_end_date || "";
 
     for (let i = 0; i < n; i++) {
       const r = cube[i];
       if (!state.includeArchived && r[C_ARCHIVED]) continue;
-      estArr[i] = calcEstCost(r[C_MODEL], r[C_IN], r[C_CR], r[C_CW], r[C_OUT], r[C_REAS]);
-      if (r[C_HARNESS] === "OpenCode" && promoProvs.has(r[C_PROVIDER]) && r[C_COST] > 0) {
+      estArr[i] = calcEstCost(r[C_MODEL], r[C_IN], r[C_CR], r[C_CW], r[C_OUT], r[C_REAS], r[C_COST]);
+      if (
+        r[C_HARNESS] === "OpenCode" &&
+        promoProvs.has(r[C_PROVIDER]) &&
+        r[C_COST] > 0 &&
+        (!promoEnd || r[C_DATE] === "unknown" || r[C_DATE] <= promoEnd)
+      ) {
         promoArr[i] = r[C_COST];
       }
     }
@@ -388,8 +395,8 @@
       const pb = rowBillingMap.get(row.parent);
       if (!pb) continue;
       const p = row.parent;
-      const estP = calcEstCost(p[C_MODEL], p[C_IN], p[C_CR], p[C_CW], p[C_OUT], p[C_REAS]);
-      const estH = calcEstCost(row[C_MODEL], row[C_IN], row[C_CR], row[C_CW], row[C_OUT], row[C_REAS]);
+      const estP = calcEstCost(p[C_MODEL], p[C_IN], p[C_CR], p[C_CW], p[C_OUT], p[C_REAS], p[C_COST]);
+      const estH = calcEstCost(row[C_MODEL], row[C_IN], row[C_CR], row[C_CW], row[C_OUT], row[C_REAS], row[C_COST]);
       const tokP = p[C_IN] + p[C_CR] + p[C_CW] + p[C_OUT] + p[C_REAS];
       const tokH = row[C_IN] + row[C_CR] + row[C_CW] + row[C_OUT] + row[C_REAS];
       const share = estP > 0 ? estH / estP : tokP > 0 ? tokH / tokP : 0;
@@ -427,7 +434,10 @@
     return getDefaultModelRate(model);
   }
 
-  function calcEstCost(model, inp, cr, cw, outTxt, reas) {
+  function calcEstCost(model, inp, cr, cw, outTxt, reas, loggedCost = 0) {
+    if (loggedCost > 0 && !(customRates && customRates[model])) {
+      return loggedCost;
+    }
     const r = getModelRate(model);
     return (
       (inp * (r.in || 0) +
@@ -488,7 +498,7 @@
     agg.subCost += rb.sub;
     agg.overageCost += rb.ov;
     agg.promoCost += rb.promo;
-    agg.estCost += calcEstCost(model, inp, cr, cw, out, reas);
+    agg.estCost += calcEstCost(model, inp, cr, cw, out, reas, row[C_COST]);
     agg.noCacheCost += calcUncachedCounterfactualCost(model, inp, cr, cw, out, reas);
     agg.harnesses.add(row[C_HARNESS]);
     agg.providers.add(row[C_PROVIDER]);
@@ -518,7 +528,7 @@
     if (metric === "active") return inp + cw + out + reas;
     if (metric === "generated") return out + reas;
     if (metric === "paid_cost") return getRowBilling(row).paid;
-    if (metric === "est_cost") return calcEstCost(row[C_MODEL], inp, cr, cw, out, reas);
+    if (metric === "est_cost") return calcEstCost(row[C_MODEL], inp, cr, cw, out, reas, row[C_COST]);
     return inp + cr + cw + out + reas;
   }
 
@@ -700,9 +710,13 @@
     const genDate = rawData.generated_at ? rawData.generated_at.replace("T", " ") : "";
     const anyFilter =
       state.rangePreset !== "all" || Object.values(state.filters).some((v) => Boolean(v));
+    const activeHarnesses =
+      (rawData.source_health || []).filter((h) => (h.sessions_count || 0) > 0 || (h.api_calls || 0) > 0).length ||
+      (rawData.source_health || []).length ||
+      5;
     const sessNote = anyFilter
       ? `${matchedSessionCount.toLocaleString()} of ${rawData.total_sessions_indexed.toLocaleString()} sessions matching filters`
-      : `${rawData.total_sessions_indexed.toLocaleString()} sessions indexed across 4 harnesses`;
+      : `${rawData.total_sessions_indexed.toLocaleString()} sessions indexed across ${activeHarnesses} harnesses`;
     sub.textContent = `Host: ${rawData.hostname} · ${sessNote} · Extracted in ${rawData.extraction_ms} ms (${genDate})`;
 
     const wrap = document.getElementById("active-filters");
@@ -1015,10 +1029,18 @@
             (ot.promo_anthropic_usd || 0) > 0
               ? `<strong>${fmtUsd(ot.session_header_promo_usd || ot.promo_anthropic_usd || 0)}</strong> promotional credits absorbed ($0 paid)`
               : `<strong>${fmtUsd(ot.direct_paid_usd || 0)}</strong> direct API spend`
+          }${
+            (ot.copilot_routed_usd || 0) > 0
+              ? ` · <strong>${fmtUsd(ot.copilot_routed_usd)}</strong> API-equiv via Copilot`
+              : ""
           }; local self-hosted GPU runs at $0.
           <strong>Antigravity:</strong> <strong>${fmtUsd(agPaidSum)}</strong> attributed across active ledger periods.${
             hasCopTelemetry
-              ? ` <strong>Copilot:</strong> <strong>${copPremReqs.toLocaleString(undefined, { maximumFractionDigits: 1 })}</strong> premium requests logged (${fmtUsd(copPaidSum)} attributed).`
+              ? ` <strong>Copilot:</strong> <strong>${copPremReqs.toLocaleString(undefined, { maximumFractionDigits: 1 })}</strong> premium requests logged (${fmtUsd(copPaidSum)} attributed${
+                  (copt.estimated_calls || 0) > 0
+                    ? `, ${Number(copt.estimated_calls).toLocaleString()} IDE text-estimated turns`
+                    : ""
+                }).`
               : ""
           }
         </div>
@@ -1142,39 +1164,53 @@
       if (stackMode === "bucket") {
         const model = r[C_MODEL];
         const rb = getRowBilling(r);
-        const parts =
-          metric === "paid_cost"
-            ? {
-                Subscriptions: rb.sub,
-                "Overages / Credits": rb.ov,
-              }
-            : metric === "est_cost"
-            ? {
-                "Cache Read": (r[C_CR] * (getModelRate(model).cr || 0)) / 1e6,
-                "Cache Write": (r[C_CW] * (getModelRate(model).cw || 0)) / 1e6,
-                "Uncached Input": (r[C_IN] * (getModelRate(model).in || 0)) / 1e6,
-                "Text Output": (r[C_OUT] * (getModelRate(model).out || 0)) / 1e6,
-                "Reasoning": (r[C_REAS] * (getModelRate(model).out || 0)) / 1e6,
-              }
-            : metric === "active"
-            ? {
-                "Cache Write": r[C_CW],
-                "Uncached Input": r[C_IN],
-                "Text Output": r[C_OUT],
-                "Reasoning": r[C_REAS],
-              }
-            : metric === "generated"
-            ? {
-                "Text Output": r[C_OUT],
-                "Reasoning": r[C_REAS],
-              }
-            : {
-                "Cache Read": r[C_CR],
-                "Cache Write": r[C_CW],
-                "Uncached Input": r[C_IN],
-                "Text Output": r[C_OUT],
-                "Reasoning": r[C_REAS],
-              };
+        let parts;
+        if (metric === "paid_cost") {
+          parts = {
+            Subscriptions: rb.sub,
+            "Overages / Credits": rb.ov,
+          };
+        } else if (metric === "est_cost") {
+          const mr = getModelRate(model);
+          parts = {
+            "Cache Read": (r[C_CR] * (mr.cr || 0)) / 1e6,
+            "Cache Write": (r[C_CW] * (mr.cw || 0)) / 1e6,
+            "Uncached Input": (r[C_IN] * (mr.in || 0)) / 1e6,
+            "Text Output": (r[C_OUT] * (mr.out || 0)) / 1e6,
+            "Reasoning": (r[C_REAS] * (mr.out || 0)) / 1e6,
+          };
+          const rawSum =
+            parts["Cache Read"] +
+            parts["Cache Write"] +
+            parts["Uncached Input"] +
+            parts["Text Output"] +
+            parts["Reasoning"];
+          const target = calcEstCost(model, r[C_IN], r[C_CR], r[C_CW], r[C_OUT], r[C_REAS], r[C_COST]);
+          if (rawSum > 0 && Math.abs(rawSum - target) > 1e-9) {
+            const scale = target / rawSum;
+            for (const bk of Object.keys(parts)) parts[bk] *= scale;
+          }
+        } else if (metric === "active") {
+          parts = {
+            "Cache Write": r[C_CW],
+            "Uncached Input": r[C_IN],
+            "Text Output": r[C_OUT],
+            "Reasoning": r[C_REAS],
+          };
+        } else if (metric === "generated") {
+          parts = {
+            "Text Output": r[C_OUT],
+            "Reasoning": r[C_REAS],
+          };
+        } else {
+          parts = {
+            "Cache Read": r[C_CR],
+            "Cache Write": r[C_CW],
+            "Uncached Input": r[C_IN],
+            "Text Output": r[C_OUT],
+            "Reasoning": r[C_REAS],
+          };
+        }
         for (const [bk, bv] of Object.entries(parts)) {
           if (bv <= 0) continue;
           pMap.set(bk, (pMap.get(bk) || 0) + bv);
@@ -2226,7 +2262,7 @@
         const cw = s.cache_write || 0;
         const out = s.output_text || 0;
         const reas = s.reasoning || 0;
-        const estCost = calcEstCost(s.model, inp, cr, cw, out, reas);
+        const estCost = calcEstCost(s.model, inp, cr, cw, out, reas, s.cost_usd || 0);
         const total = inp + cr + cw + out + reas;
         const active = inp + cw + out + reas;
         const generated = out + reas;
@@ -2573,7 +2609,7 @@
     const lines = [header.join(",")];
     for (const r of rows) {
       const tot = r[C_IN] + r[C_CR] + r[C_CW] + r[C_OUT] + r[C_REAS];
-      const est = calcEstCost(r[C_MODEL], r[C_IN], r[C_CR], r[C_CW], r[C_OUT], r[C_REAS]);
+      const est = calcEstCost(r[C_MODEL], r[C_IN], r[C_CR], r[C_CW], r[C_OUT], r[C_REAS], r[C_COST]);
       const rb = getRowBilling(r);
       const vals = [
         r[C_DATE], r[C_HARNESS], r[C_PROVIDER], r[C_MODEL], r[C_PROJECT], r[C_ACTOR], r[C_ARCHIVED],
