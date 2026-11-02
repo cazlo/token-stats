@@ -44,6 +44,7 @@
     win: null, // [loDt, hiDt] in ms relative to D.t0; null = whole session
     focus: null, // agent index or null
     sort: null, // {col, dir} for the agents table; null = original order
+    idleGap: 5 * 60e3, // gaps between calls longer than this (CI waits, human input…) don't count as active time
   };
 
   // ---------------------------------------------------------------------------
@@ -146,6 +147,17 @@
 
   function win() {
     return state.win || fullWin;
+  }
+
+  // Active duration: sum of the gaps between consecutive call times (ascending), skipping any
+  // gap longer than the idle threshold. Note it measures call spacing, so it can't see a single long call.
+  function activeMs(times) {
+    let sum = 0;
+    for (let i = 1; i < times.length; i++) {
+      const g = times[i] - times[i - 1];
+      if (g <= state.idleGap) sum += g;
+    }
+    return sum;
   }
 
   function inWin(dt) {
@@ -301,7 +313,7 @@
       idx: i,
       calls: 0, inp: 0, cr: 0, cw: 0, out: 0, reas: 0, est: 0,
       first: Infinity, last: -Infinity, peak: 0, compactions: 0,
-      models: new Set(), efforts: new Map(), prevPrompt: 0,
+      models: new Set(), efforts: new Map(), prevPrompt: 0, times: [], activeMs: 0,
     }));
     D.calls.forEach((c, i) => {
       const s = st[c[K_AGENT]];
@@ -310,6 +322,7 @@
       s.prevPrompt = p;
       if (!inWin(c[K_DT])) return;
       s.calls++;
+      s.times.push(c[K_DT]);
       s.inp += c[K_IN];
       s.cr += c[K_CR];
       s.cw += c[K_CW];
@@ -328,6 +341,7 @@
       s.total = s.inp + s.cr + s.cw + s.out + s.reas;
       s.active = s.inp + s.cw + s.out + s.reas;
       s.generated = s.out + s.reas;
+      s.activeMs = activeMs(s.times); // calls are time-ordered, so times is ascending
     }
     return st;
   }
@@ -349,6 +363,7 @@
       <span>Project <strong>${esc(D.project)}</strong></span>
       <span><strong>${esc(fmtDateTime(first))}</strong> → <strong>${esc(sameDay(first, last) ? fmtClock(last, true) : fmtDateTime(last))}</strong></span>
       <span>Duration <strong>${esc(fmtDuration(last - first))}</strong></span>
+      <span title="Wall-clock time with calls going, ignoring gaps over ${esc(fmtDuration(state.idleGap))} between calls (e.g. CI waits or waiting on a human). Subagents running in parallel count once.">Active <strong>${esc(fmtDuration(activeMs(D.calls.map((c) => c[K_DT]))))}</strong></span>
       <span><strong>${subs}</strong> subagent${subs === 1 ? "" : "s"}</span>
       <span><strong>${D.calls.length.toLocaleString()}</strong> calls</span>
       <span class="mono" style="font-size:11.5px">${esc(D.models.join(", "))}</span>
@@ -909,6 +924,7 @@
     },
     { key: "start", label: "Start", val: (s) => s.first },
     { key: "span", label: "Span", num: true, val: (s) => s.last - s.first },
+    { key: "activeDur", label: "Active", num: true, val: (s) => s.activeMs },
     { key: "calls", label: "Calls", num: true, right: true, val: (s) => s.calls },
     { key: "est", label: "Est. $", num: true, right: true, val: (s) => s.est },
     { key: "active", label: "Fresh/Active", num: true, right: true, val: (s) => s.active },
@@ -956,6 +972,7 @@
             }</td>
             <td class="num" style="white-space:nowrap">${has ? esc(fmtClock(s.first, true)) : "—"}</td>
             <td class="num" style="white-space:nowrap">${has ? esc(fmtDuration(s.last - s.first)) : "—"}</td>
+            <td class="num" style="white-space:nowrap">${has ? esc(fmtDuration(s.activeMs)) : "—"}</td>
             <td class="right num">${s.calls.toLocaleString()}</td>
             <td class="right num">${fmtUsd(s.est)}</td>
             <td class="right num">${fmtTok(s.active)}</td>
@@ -970,7 +987,7 @@
     const heads = TABLE_COLS.map((c) => {
       const active = state.sort && state.sort.col === c.key;
       const arrow = active ? (state.sort.dir === -1 ? " ↓" : " ↑") : "";
-      return `<th class="sortable${c.right ? " right" : ""}" data-col="${c.key}" title="Click to sort">${c.label}${arrow}</th>`;
+      return `<th class="sortable${c.right ? " right" : ""}" data-col="${c.key}" title="${c.key === "activeDur" ? "Time with calls going, ignoring gaps over the idle threshold · " : ""}Click to sort">${c.label}${arrow}</th>`;
     }).join("");
     wrap.innerHTML = `
       <table class="data-table">
@@ -1048,6 +1065,11 @@
     });
     document.getElementById("metric-select").addEventListener("change", (e) => {
       state.metric = e.target.value;
+      renderAll();
+    });
+    document.getElementById("idle-select").addEventListener("change", (e) => {
+      state.idleGap = Number(e.target.value);
+      renderHeader();
       renderAll();
     });
     document.querySelectorAll("#stack-group .seg-btn").forEach((btn) =>

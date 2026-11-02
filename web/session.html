@@ -45,6 +45,16 @@
             <option value="est_cost">Est. API-Equivalent Value ($)</option>
           </select>
         </div>
+        <div class="control-group">
+          <span class="control-label" title="Gaps between calls longer than this (CI waits, waiting on a human) are left out of Active time">Idle Gap</span>
+          <select id="idle-select">
+            <option value="60000">1 min</option>
+            <option value="120000">2 min</option>
+            <option value="300000" selected>5 min</option>
+            <option value="600000">10 min</option>
+            <option value="1800000">30 min</option>
+          </select>
+        </div>
         <div class="control-group" id="window-controls">
           <span class="control-label">Window</span>
           <span class="mono window-label" id="window-label"></span>
