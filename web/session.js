@@ -43,6 +43,7 @@
     mode: "interval",
     win: null, // [loDt, hiDt] in ms relative to D.t0; null = whole session
     focus: null, // agent index or null
+    sort: null, // {col, dir} for the agents table; null = original order
   };
 
   // ---------------------------------------------------------------------------
@@ -488,16 +489,21 @@
       if (state.stack === "model") return D.models[c[K_MODEL]];
       if (state.stack === "effort") return fmtEffort(effortOf(c));
       const a = c[K_AGENT];
-      return agentInTop[a] ? `a${a}` : "Other";
+      return agentInTop[a] || a === state.focus ? `a${a}` : "Other";
     };
+    // With an agent focused, other agents' calls still draw (dimmed, stacked above) under "~"-prefixed keys
+    const DIM = "~";
+    const isDimCall = (c) => state.focus !== null && c[K_AGENT] !== state.focus;
 
     const bins = [...Array(nBins)].map(() => new Map());
-    const totals = new Map();
+    const totals = new Map(); // base key -> total (focused agent only when one is focused)
+    const seen = new Set(); // base keys present in the window (any agent)
     const before = new Map(); // cumulative carry-in from calls before the window
     D.calls.forEach((c, i) => {
-      if (state.focus !== null && c[K_AGENT] !== state.focus) return;
+      const dim = isDimCall(c);
       const dt = c[K_DT];
-      const parts = state.stack === "bucket" ? bucketParts(i) : { [keyOf(i)]: metricOf(i) };
+      const raw = state.stack === "bucket" ? bucketParts(i) : { [keyOf(i)]: metricOf(i) };
+      const parts = dim ? Object.fromEntries(Object.entries(raw).map(([k, v]) => [DIM + k, v])) : raw;
       if (dt < binStart) {
         if (state.mode === "cumulative") for (const [k, v] of Object.entries(parts)) before.set(k, (before.get(k) || 0) + v);
         return;
@@ -507,11 +513,13 @@
       for (const [k, v] of Object.entries(parts)) {
         if (!(v > 0)) continue;
         bins[b].set(k, (bins[b].get(k) || 0) + v);
-        totals.set(k, (totals.get(k) || 0) + v);
+        const base = k.startsWith(DIM) ? k.slice(DIM.length) : k;
+        seen.add(base);
+        if (base === k) totals.set(k, (totals.get(k) || 0) + v);
       }
     });
 
-    let keys = [...totals.keys()];
+    let keys = [...seen];
     if (state.stack === "agent") {
       keys.sort((a, b) => (a === "Other") - (b === "Other") || Number(a.slice(1)) - Number(b.slice(1)));
     } else if (state.stack === "bucket") {
@@ -523,7 +531,14 @@
     } else {
       keys.sort((a, b) => D.models.indexOf(a) - D.models.indexOf(b));
     }
-    if (state.mode === "cumulative") for (const k of before.keys()) if (!keys.includes(k)) keys.push(k);
+    if (state.mode === "cumulative") {
+      for (const k0 of before.keys()) {
+        const k = k0.startsWith(DIM) ? k0.slice(DIM.length) : k0;
+        if (!keys.includes(k)) keys.push(k);
+      }
+    }
+    // Draw order: the focused agent's series first (bottom, shared baseline), dimmed others above
+    const drawKeys = state.focus === null ? keys : [...keys, ...keys.map((k) => DIM + k)];
 
     const colorOf = (k) => {
       if (state.stack === "agent") return k === "Other" ? PALETTE.other : agentColor[Number(k.slice(1))];
@@ -544,7 +559,7 @@
     const binVals = bins.map((m) => {
       const vals = {};
       let sum = 0;
-      for (const k of keys) {
+      for (const k of drawKeys) {
         let v = m.get(k) || 0;
         if (state.mode === "cumulative") {
           v += running.get(k) || 0;
@@ -577,20 +592,22 @@
       const x = xOf(t) + (binPx - barW) / 2;
       if (x + barW < PAD_L || x > PAD_L + plotW) return;
       let y = padT + plotH;
-      for (const k of keys) {
-        const v = b.vals[k] || 0;
+      for (const dk of drawKeys) {
+        const v = b.vals[dk] || 0;
         if (v <= 0) continue;
+        const dim = dk.startsWith(DIM);
+        const k = dim ? dk.slice(DIM.length) : dk;
         const h = Math.min(y - padT, Math.max(0.8, (v / maxTotal) * plotH));
         y -= h;
         const off = padT + plotH - (y + h);
-        out += `<rect class="seg" data-s="${seriesIdx[k]}" data-off="${off.toFixed(2)}" x="${x.toFixed(2)}" y="${y.toFixed(2)}" width="${barW.toFixed(2)}" height="${h.toFixed(2)}" fill="${colorOf(k)}" rx="${barW > 4 ? 1.2 : 0}" />`;
+        out += `<rect class="seg${dim ? " dim-agent" : ""}" data-s="${seriesIdx[k]}" data-off="${off.toFixed(2)}" x="${x.toFixed(2)}" y="${y.toFixed(2)}" width="${barW.toFixed(2)}" height="${h.toFixed(2)}" fill="${colorOf(k)}" rx="${barW > 4 ? 1.2 : 0}" />`;
       }
       out += `<rect class="bar-hit" data-bin="${bi}" x="${Math.max(PAD_L, xOf(t)).toFixed(2)}" y="${padT}" width="${Math.max(1, binPx).toFixed(2)}" height="${plotH}" fill="transparent" />`;
     });
     out += attachBrush(svg, width, PAD_L, plotW, padT, plotH, (x) => lo + ((x - PAD_L) / plotW) * span);
     svg.innerHTML = out || "";
 
-    if (!totals.size && state.mode !== "cumulative") {
+    if (!seen.size && state.mode !== "cumulative") {
       svg.insertAdjacentHTML("beforeend", `<text x="${width / 2}" y="${height / 2}" text-anchor="middle" fill="var(--text-muted)">No calls in this window.</text>`);
     }
 
@@ -603,11 +620,14 @@
         const bi = Number(r.dataset.bin);
         const b = binVals[bi];
         const t = binStart + bi * step;
-        const rows = keys
-          .filter((k) => b.vals[k] > 0)
-          .reverse()
-          .map((k) => `<div class="tt-row"><span><span class="swatch" style="background:${colorOf(k)};margin-right:6px;"></span>${esc(labelOf(k))}</span><span class="num">${fmtMetric(b.vals[k])}</span></div>`)
-          .join("");
+        const otherSum = state.focus === null ? 0 : keys.reduce((s, k) => s + (b.vals[DIM + k] || 0), 0);
+        const rows =
+          keys
+            .filter((k) => b.vals[k] > 0)
+            .reverse()
+            .map((k) => `<div class="tt-row"><span><span class="swatch" style="background:${colorOf(k)};margin-right:6px;"></span>${esc(labelOf(k))}</span><span class="num">${fmtMetric(b.vals[k])}</span></div>`)
+            .join("") +
+          (otherSum > 0 ? `<div class="tt-row" style="opacity:0.6"><span>Other agents</span><span class="num">${fmtMetric(otherSum)}</span></div>` : "");
         tooltip.innerHTML = `
           <div class="tt-title"><span>${esc(fmtClock(t, step < 60e3, !sameDay(lo, hi)))} – ${esc(fmtClock(t + step, step < 60e3))}${state.mode === "cumulative" ? " · cumulative" : ""}</span><span class="num">${fmtMetric(b.total)}</span></div>
           ${rows || '<div style="color:var(--text-dim)">No calls</div>'}`;
@@ -618,9 +638,10 @@
       });
     });
 
+    const legendDim = (k) => state.focus !== null && state.stack === "agent" && k !== `a${state.focus}`;
     legendEl.innerHTML = keys
       .map(
-        (k) => `<span class="legend-item" data-s="${seriesIdx[k]}" ${state.stack === "agent" && k !== "Other" ? `data-agent="${k.slice(1)}"` : ""}>
+        (k) => `<span class="legend-item${legendDim(k) ? " is-dim" : ""}" data-dim="${legendDim(k) ? 1 : 0}" data-s="${seriesIdx[k]}" ${state.stack === "agent" && k !== "Other" ? `data-agent="${k.slice(1)}"` : ""}>
           <span class="swatch" style="background:${colorOf(k)}"></span><span>${esc(labelOf(k))}</span>
           <strong class="num" style="color:var(--text)">${fmtMetric(state.mode === "cumulative" ? binVals[binVals.length - 1].vals[k] || 0 : totals.get(k) || 0)}</strong>
         </span>`
@@ -631,11 +652,11 @@
     const spot = (si) => {
       svg.classList.toggle("series-focus", si !== null);
       segs.forEach((r) => {
-        const on = si !== null && r.dataset.s === si;
+        const on = si !== null && r.dataset.s === si && !r.classList.contains("dim-agent");
         r.classList.toggle("is-focus", on);
         r.style.transform = on && Number(r.dataset.off) > 0 ? `translateY(${r.dataset.off}px)` : "";
       });
-      items.forEach((el) => el.classList.toggle("is-dim", si !== null && el.dataset.s !== si));
+      items.forEach((el) => el.classList.toggle("is-dim", si !== null ? el.dataset.s !== si : el.dataset.dim === "1"));
     };
     items.forEach((el) => {
       el.addEventListener("mouseenter", () => spot(el.dataset.s));
@@ -876,9 +897,45 @@
   // Agents table
   // ---------------------------------------------------------------------------
 
+  // Agents-table columns: key, header label, numeric (right-aligned, sorts high-first), sort value
+  const TABLE_COLS = [
+    { key: "agent", label: "Agent", val: (s) => agentLabel(s.idx, 200).toLowerCase() },
+    { key: "role", label: "Role", val: (s) => D.agents[s.idx].actor || "" },
+    { key: "model", label: "Model", val: (s) => [...s.models][0] || D.agents[s.idx].model || "" },
+    {
+      key: "effort",
+      label: "Effort",
+      val: (s) => (s.efforts.size ? fmtEffort([...s.efforts].sort((x, y) => y[1] - x[1])[0][0]) : ""),
+    },
+    { key: "start", label: "Start", val: (s) => s.first },
+    { key: "span", label: "Span", num: true, val: (s) => s.last - s.first },
+    { key: "calls", label: "Calls", num: true, right: true, val: (s) => s.calls },
+    { key: "est", label: "Est. $", num: true, right: true, val: (s) => s.est },
+    { key: "active", label: "Fresh/Active", num: true, right: true, val: (s) => s.active },
+    { key: "cr", label: "Cache Read", num: true, right: true, val: (s) => s.cr },
+    { key: "gen", label: "Out+Reason", num: true, right: true, val: (s) => s.generated },
+    { key: "total", label: "Total", num: true, right: true, val: (s) => s.total },
+    { key: "peak", label: "Peak Ctx", num: true, right: true, val: (s) => s.peak },
+    { key: "drops", label: "Drops", num: true, right: true, val: (s) => s.compactions },
+  ];
+
+  function sortedStats(stats) {
+    if (!state.sort) return stats;
+    const col = TABLE_COLS.find((c) => c.key === state.sort.col);
+    if (!col) return stats;
+    const dir = state.sort.dir;
+    // Agents with no calls in the window always sink to the bottom
+    return [...stats].sort((a, b) => {
+      if ((a.calls > 0) !== (b.calls > 0)) return a.calls > 0 ? -1 : 1;
+      const va = col.val(a), vb = col.val(b);
+      const c = typeof va === "string" ? va.localeCompare(vb) : va - vb;
+      return c * dir || a.idx - b.idx;
+    });
+  }
+
   function renderTable(stats) {
     const wrap = document.getElementById("agents-table-wrap");
-    const rows = stats
+    const rows = sortedStats(stats)
       .map((s) => {
         const a = D.agents[s.idx];
         const sel = state.focus === s.idx ? "selected-row" : "";
@@ -900,26 +957,36 @@
             <td class="num" style="white-space:nowrap">${has ? esc(fmtClock(s.first, true)) : "—"}</td>
             <td class="num" style="white-space:nowrap">${has ? esc(fmtDuration(s.last - s.first)) : "—"}</td>
             <td class="right num">${s.calls.toLocaleString()}</td>
+            <td class="right num">${fmtUsd(s.est)}</td>
             <td class="right num">${fmtTok(s.active)}</td>
             <td class="right num">${fmtTok(s.cr)}</td>
             <td class="right num">${fmtTok(s.generated)}</td>
             <td class="right num"><strong>${fmtTok(s.total)}</strong></td>
-            <td class="right num">${fmtUsd(s.est)}</td>
             <td class="right num">${fmtTok(s.peak)}</td>
             <td class="right num">${s.compactions || "—"}</td>
           </tr>`;
       })
       .join("");
+    const heads = TABLE_COLS.map((c) => {
+      const active = state.sort && state.sort.col === c.key;
+      const arrow = active ? (state.sort.dir === -1 ? " ↓" : " ↑") : "";
+      return `<th class="sortable${c.right ? " right" : ""}" data-col="${c.key}" title="Click to sort">${c.label}${arrow}</th>`;
+    }).join("");
     wrap.innerHTML = `
       <table class="data-table">
-        <thead><tr>
-          <th>Agent</th><th>Role</th><th>Model</th><th>Effort</th><th>Start</th><th>Span</th>
-          <th class="right">Calls</th><th class="right">Fresh/Active</th><th class="right">Cache Read</th>
-          <th class="right">Out+Reason</th><th class="right">Total</th><th class="right">Est. $</th>
-          <th class="right">Peak Ctx</th><th class="right">Drops</th>
-        </tr></thead>
+        <thead><tr>${heads}</tr></thead>
         <tbody>${rows}</tbody>
       </table>`;
+    wrap.querySelectorAll("th[data-col]").forEach((th) => {
+      th.addEventListener("click", () => {
+        const col = TABLE_COLS.find((c) => c.key === th.dataset.col);
+        const first = col.num ? -1 : 1; // numbers start high-first, text A→Z
+        const cur = state.sort && state.sort.col === col.key ? state.sort.dir : 0;
+        // first click: natural direction, second: reversed, third: back to original order
+        state.sort = cur === 0 ? { col: col.key, dir: first } : cur === first ? { col: col.key, dir: -first } : null;
+        renderTable(stats);
+      });
+    });
     wrap.querySelectorAll("tr[data-agent]").forEach((tr) => {
       tr.addEventListener("click", () => {
         const i = Number(tr.dataset.agent);
