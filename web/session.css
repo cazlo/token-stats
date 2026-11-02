@@ -125,3 +125,10 @@
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+
+/* Burn chart: other agents' bars while one agent is focused */
+.chart-svg rect.seg.dim-agent,
+.chart-svg.series-focus rect.seg.dim-agent,
+.chart-svg.series-focus rect.seg.dim-agent.is-focus {
+  opacity: 0.2;
+}

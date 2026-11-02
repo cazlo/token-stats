@@ -79,7 +79,8 @@ Every session in **Heavyweight Sessions & Subagent Runs** links to `session.html
 - **Token Burn Over Time** — stacked by agent, token type, model or reasoning effort, per interval or cumulative.
 - **Agent Lanes** — when the main session and each subagent were active, with dashed connectors where a subagent was spawned.
 - **Context Size per Call** — prompt size on every call per agent, with ▼ marking sharp drops (usually compactions).
-- **Agents** table — calls, tokens, est. $ (using exact logged per-call USD when available unless overridden in the Rate Card), peak context and drops per agent for the visible window.
+- **Agents** table — calls, est. $ (using exact logged per-call USD when available unless overridden in the Rate Card), tokens, peak context and drops per agent for the visible window. Click any column header to sort.
+- **Active duration** — time with calls going, ignoring gaps between calls longer than the *Idle Gap* setting (default 5 min), so CI waits and waiting on a human don't inflate it. Shown for the whole session in the header (parallel subagents count once) and per agent in the table.
 
 Reasoning effort is shown per call, per agent and for the whole session where the harness logs it: Claude Code (`perTurnEffort` / `effort` on each assistant entry), Codex (`turn_context` effort, falling back to the thread's `reasoning_effort`), OpenCode (`model.variant` / `variant`), and GitHub Copilot (`reasoning_effort` / `reasoningBucket`). Antigravity shows it as *not logged*.
 
