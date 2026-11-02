@@ -4,7 +4,7 @@ Guidance for AI coding agents working in this repo. See `README.md` for what the
 
 ## Layout
 
-- `token_stats.py` — the whole backend: per-harness extractors (Claude Code, Codex, OpenCode, Antigravity), merge into the `cube` / `cube_hourly` payload, billing ledger, CLI and local HTTP server.
+- `token_stats.py` — the whole backend: per-harness extractors (Claude Code, Codex, OpenCode, Antigravity, GitHub Copilot), merge into the `cube` / `cube_hourly` payload, billing ledger, CLI and local HTTP server.
 - `web/` — `index.html` + `app.js` (the dashboard), `session.html` + `session.js` + `session.css` (per-session timeline page), shared `common.js` (palettes, formatting, storage keys) and `styles.css`. Vanilla JS, inline SVG charts.
 - Generated, git-ignored: `data/` (parse cache, `stats.json`, billing overrides, session-detail manifest), `web/data.js` and `web/sessions/*.js` (one per-call timeline per session group). Never commit these — they hold the user's local usage data.
 

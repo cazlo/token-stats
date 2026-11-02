@@ -12,15 +12,19 @@
   --accent: #5cc8ff;
   --accent-soft: rgba(92, 200, 255, 0.14);
 
-  /* Harness & Provider palette (brand-aligned; keep in sync with PALETTES in app.js) */
+  /* Harness & Provider palette (brand-aligned; keep in sync with PALETTES in common.js) */
   --c-claude: #e07a55;
   --c-codex: #5a95f5;
   --c-opencode: #c94fa8;
   --c-antigravity: #86e3a5;
+  --c-copilot: #f5b731;
 
   --c-anthropic: #e07a55;
   --c-openai: #5a95f5;
   --c-google: #86e3a5;
+  --c-xai: #fde047;
+  --c-moonshot: #22d3ee;
+  --c-microsoft: #3b4cca;
   --c-local-gpu: #c94fa8;
 
   /* Token bucket palette */
@@ -58,9 +62,13 @@
   --c-codex: #2563eb;
   --c-opencode: #b8389a;
   --c-antigravity: #0f6b2f;
+  --c-copilot: #ca8a04;
   --c-anthropic: #e0784a;
   --c-openai: #2563eb;
   --c-google: #0f6b2f;
+  --c-xai: #ca8a04;
+  --c-moonshot: #06b6d4;
+  --c-microsoft: #312e81;
   --c-local-gpu: #b8389a;
 }
 
@@ -215,6 +223,7 @@ button.active, .seg-btn.active {
 
 .seg-group {
   display: inline-flex;
+  flex-wrap: wrap;
   background: var(--bg-subtle);
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);

@@ -9,7 +9,7 @@
   let PALETTE = T.PALETTES.dark;
 
   // Call row columns (see "call_columns" in the detail file)
-  const K_DT = 0, K_AGENT = 1, K_MODEL = 2, K_IN = 3, K_CR = 4, K_CW = 5, K_OUT = 6, K_REAS = 7, K_EFFORT = 9;
+  const K_DT = 0, K_AGENT = 1, K_MODEL = 2, K_IN = 3, K_CR = 4, K_CW = 5, K_OUT = 6, K_REAS = 7, K_COST = 8, K_EFFORT = 9;
 
   const TOP_AGENTS = 10;
   const PAD_L = 160; // shared left gutter so every chart's time axis lines up
@@ -56,7 +56,12 @@
   function computeEst() {
     callEst = new Float64Array(D.calls.length);
     D.calls.forEach((c, i) => {
-      const r = rateFor(D.models[c[K_MODEL]]);
+      const model = D.models[c[K_MODEL]];
+      if ((c[K_COST] || 0) > 0 && !(customRates && customRates[model])) {
+        callEst[i] = c[K_COST];
+        return;
+      }
+      const r = rateFor(model);
       callEst[i] = (c[K_IN] * (r.in || 0) + c[K_CR] * (r.cr || 0) + c[K_CW] * (r.cw || 0) + (c[K_OUT] + c[K_REAS]) * (r.out || 0)) / 1e6;
     });
   }
@@ -389,7 +394,7 @@
         <div class="kpi-sub">${fmtTok(reas)} reasoning</div>
       </div>
       <div class="kpi-card">
-        <div class="kpi-label"><span>Est. API Value</span><span>List rates</span></div>
+        <div class="kpi-label"><span>Est. API Value</span><span>Logged / list</span></div>
         <div class="kpi-value">${fmtUsd(est)}</div>
         <div class="kpi-sub">cache hit ${totIn > 0 ? ((cr / totIn) * 100).toFixed(1) : "0.0"}%</div>
       </div>
@@ -419,13 +424,25 @@
     const c = D.calls[i];
     if (state.metric === "est_cost") {
       const r = rateFor(D.models[c[K_MODEL]]);
-      return {
+      const parts = {
         "Cache Read": (c[K_CR] * (r.cr || 0)) / 1e6,
         "Cache Write": (c[K_CW] * (r.cw || 0)) / 1e6,
         "Uncached Input": (c[K_IN] * (r.in || 0)) / 1e6,
         "Text Output": (c[K_OUT] * (r.out || 0)) / 1e6,
         "Reasoning": (c[K_REAS] * (r.out || 0)) / 1e6,
       };
+      const rawSum =
+        parts["Cache Read"] +
+        parts["Cache Write"] +
+        parts["Uncached Input"] +
+        parts["Text Output"] +
+        parts["Reasoning"];
+      const target = callEst[i];
+      if (rawSum > 0 && Math.abs(rawSum - target) > 1e-9) {
+        const scale = target / rawSum;
+        for (const k of Object.keys(parts)) parts[k] *= scale;
+      }
+      return parts;
     }
     const all = {
       "Cache Read": c[K_CR],
